@@ -1,0 +1,11 @@
+# Data
+data/
+
+# Eval text files
+sim/eval/*.txt
+sim/eval/*.md
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
