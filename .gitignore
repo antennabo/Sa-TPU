@@ -1,0 +1,98 @@
+# ============================================================
+# Claude Code — personal / local files (do NOT commit)
+# ============================================================
+# Local settings overrides (personal, not shared config)
+.claude/settings.local.json
+# Plan files are ephemeral and personal
+.claude/plans/
+
+# NOTE: .claude/settings.json (project-level shared settings) is
+# intentionally NOT ignored — commit it for team sharing.
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# mypy / type checkers
+.mypy_cache/
+.dmypy.json
+.pyright/
+
+# ============================================================
+# SystemVerilog / Verilator
+# ============================================================
+obj_dir/
+*.vcd
+*.fst
+*.lxt
+*.o
+*.a
+*.so
+V*.cpp
+V*.h
+V*.mk
+
+# ============================================================
+# Vivado / Xilinx
+# ============================================================
+*.xpr
+*.xsa
+*.bit
+*.bin
+*.ltx
+*.jou
+*.log
+.Xil/
+*.xci
+*.xcix
+ip_user_files/
+ipstatic/
+*.dcp
+*.edf
+*.ncd
+*.ngc
+*.ngd
+*.ngr
+*.xnm
+*.xwbt
+vivado_*.backup.log
+
+# ============================================================
+# General
+# ============================================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
