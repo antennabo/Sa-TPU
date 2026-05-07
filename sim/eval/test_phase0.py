@@ -3,8 +3,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from ir import MatMulIR, ReductionOrder
 from hw import HardwareConfig
-from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline
-from result import AnalysisResult, PerfResult, MemoryResult
+from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline, StaticNumericalAnalyzer
+from result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
 # 1. 手写 IR
 op = MatMulIR(
     op_type="matmul",
@@ -24,7 +24,7 @@ hw = HardwareConfig(
 )
 
 # 3. 跑 Pipeline
-pipeline = AnalysisPipeline([RooflinePerfAnalyzer(), MemoryAnalyzer()])
+pipeline = AnalysisPipeline([RooflinePerfAnalyzer(), MemoryAnalyzer(), StaticNumericalAnalyzer()])
 results = pipeline.run(op, hw)
 
 for name, r in results.items():
@@ -35,5 +35,6 @@ def contract_test(analyzer, op, hw, expected_type):
     assert isinstance(result, expected_type), f"{type(analyzer).__name__} 返回了错误类型: {type(result)}"
     print(f"ContractTest passed: {type(analyzer).__name__}")
 
-contract_test(RooflinePerfAnalyzer(), op, hw, PerfResult)
-contract_test(MemoryAnalyzer(),       op, hw, MemoryResult)
+contract_test(RooflinePerfAnalyzer(),    op, hw, PerfResult)
+contract_test(MemoryAnalyzer(),          op, hw, MemoryResult)
+contract_test(StaticNumericalAnalyzer(), op, hw, NumericalResult)

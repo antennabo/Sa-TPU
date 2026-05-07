@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -23,6 +23,8 @@ class MatMulIR(OpIR):
     accum_dtype: str # "fp32" / "int32"
     tile:   Optional[dict] = None #{"tm":64,"tn":64,"tk":64}
     reduction_order: Optional[ReductionOrder] = None
+    mapping:         Optional[dict] = None   # MXU 维度绑定
+    schedule:        None           = None   # cycle-accurate 预留
 
 @dataclass(frozen=True)
 class Conv2dIR(OpIR):
@@ -35,3 +37,8 @@ class Conv2dIR(OpIR):
     K: int # filter num
     R: int # kernel height
     S: int # kernel width
+
+    tile:            Optional[dict]           = None
+    reduction_order: Optional[ReductionOrder] = None
+    mapping:         Optional[dict]           = None
+    schedule:        None                     = None
