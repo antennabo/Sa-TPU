@@ -58,6 +58,15 @@ class RooflinePerfAnalyzer(Analyzer):
         )
     
 class MemoryAnalyzer(Analyzer):
+    # TODO: 跨层数据复用分析 - 中间 tensor 若能驻留 SRAM，hbm_bytes 可减少
+    # 当前 hbm_bytes 为悲观估计（假设每层都从 HBM 读写）
+    # 举个例子，SimpleCNN 的数据流：
+    # Conv2d 输出 [1,8,28,28] → ReLU → MaxPool 输出 [1,8,14,14] → Linear
+    # 如果 Conv 输出能留在 SRAM 里直到 MaxPool 用完，就省了一次 HBM 写+读。
+    # 分析的问题就是：这个中间 tensor 能放进 SRAM 吗？
+    # Conv 输出大小 = 1×8×28×28×4 bytes = 25088 bytes ≈ 25 KB
+    # SRAM = 16 MB
+    # 25KB << 16MB，完全放得下，可以复用。
     name = "memory"
 
     def analyze(self, op, hw):
@@ -150,3 +159,12 @@ class AnalysisPipeline:
 
     def run(self, op, hw) -> dict:
         return {type(a).__name__: a.run(op, hw) for a in self.analyzers}
+    
+    def run_graph(self, ops: list, hw: HardwareConfig) -> dict:
+        results = {}
+        for i, op in enumerate(ops):
+            try:
+                results[f"{op.op_type}_{i}"] = self.run(op, hw)
+            except (NotImplementedError, AttributeError):
+                results[f"{op.op_type}_{i}"] = None  # 暂不支持
+        return results

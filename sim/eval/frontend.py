@@ -1,5 +1,5 @@
 import torch
-from ir import Conv2dIR, MatMulIR
+from ir import Conv2dIR, MatMulIR, ElementwiseIR
 
 def export_to_ir(exported, dtype="fp32") -> list:
     irs = []
@@ -31,5 +31,15 @@ def export_to_ir(exported, dtype="fp32") -> list:
                 op_type="linear", dtype=dtype, accum_dtype="fp32",
                 M=M, N=N_out, K=K,
             ))
+        elif "relu" in name:
+            shape = tuple(node.meta["val"].shape)
+            irs.append(ElementwiseIR(op_type="elementwise", dtype="fp32", op="relu", shape=shape))
 
+        elif "max_pool" in name:
+            shape = tuple(node.meta["val"].shape)
+            irs.append(ElementwiseIR(op_type="elementwise", dtype="fp32", op="maxpool", shape=shape))
+
+        elif "view" in name:
+            shape = tuple(node.meta["val"].shape)
+            irs.append(ElementwiseIR(op_type="elementwise", dtype="fp32", op="flatten", shape=shape))
     return irs
