@@ -679,8 +679,8 @@ Pass 也应是纯函数（不修改输入 IR，返回新 IR），便于 DSE 的�
 阶段三：量化 Pass 与 DSE 搜索器
   □ 实现 QuantizationPass（dtype + accum_dtype 决策）
   □ 实现 DSE 搜索器框架（穷举起步，可演进为启发式）- reserved
-  □ Tiling 搜索空间枚举
-  □ Mapping 搜索空间枚举（与 reduction_order 联动）
+  □ Tiling 搜索空间枚举 - reserved
+  □ Mapping 搜索空间枚举（与 reduction_order 联动）- reserved
 
 阶段四：接入 Cycle-Accurate
   □ 实现 SchedulingPass（指令序列 / DMA 调度）
