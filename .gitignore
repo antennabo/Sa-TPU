@@ -2,7 +2,6 @@
 data/
 
 # Eval text files
-sim/eval/*.txt
 sim/eval/*.md
 
 # Python bytecode

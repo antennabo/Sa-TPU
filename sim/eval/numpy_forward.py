@@ -2,7 +2,7 @@ import torch
 import sys
 from torchvision import datasets, transforms
 import numpy as np
-
+from numpy_ops import conv2d, maxpool, np_linear, np_relu, quantize_int8
 sys.path.insert(0, "../model")
 from SimpleCNN import SimpleCNN
 

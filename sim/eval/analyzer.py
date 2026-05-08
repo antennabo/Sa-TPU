@@ -92,66 +92,79 @@ class MemoryAnalyzer(Analyzer):
 
 class StaticNumericalAnalyzer(Analyzer):
     name = "numerical"
-    
-    @staticmethod
-    def _kahan_sum(vals: list[float]) -> float:
-        """fp64 + Kahan 求和，作为黄金基准"""
-        s, c = 0.0, 0.0
-        for v in vals:
-            y = v - c
-            t = s + y
-            c = (t - s) - y
-            s = t
-        return s
-    
-    @staticmethod
-    def _sequential_sum(vals, dtype):
-        """线性累加，模拟 fp16/int8 精度"""
-        # 用 Python float 模拟，后续可换成 numpy fp16
-        s = 0.0
-        for v in vals:
-            s += v
-        return s
+
+    def analyze(self, op, _hw):
+        if not hasattr(op, "input_weight") or op.input_weight is None:
+            raise NotImplementedError(f"{type(op).__name__} 没有 input_weight，无法分析")
+        return self._analyze_real(op)
 
     @staticmethod
-    def _tree_sum(vals, dtype):
-        if len(vals) == 1:
-            return vals[0]
-        mid = len(vals) // 2
-        return StaticNumericalAnalyzer._tree_sum(vals[:mid], dtype) + \
-               StaticNumericalAnalyzer._tree_sum(vals[mid:], dtype)
-    
-    def analyze(self, op: OpIR, _hw: HardwareConfig) -> AnalysisResult:
-        # TODO: 阶段2替换为真实输入数据
-        rng = random.Random(hash((op.M, op.N, op.K, op.dtype)))
-        samples = [rng.gauss(0, 1) for _ in range(op.K)]
+    def _analyze_real(op):
+        import numpy as np
+        from numpy_ops import np_linear, conv2d, quantize_int8
+        from ir import MatMulIR, Conv2dIR
 
-        ref = StaticNumericalAnalyzer._kahan_sum(samples)
+        W = op.input_weight.astype(np.float32)
+        b = op.bias.astype(np.float32) if op.bias is not None else 0
 
-        if op.reduction_order == ReductionOrder.SEQUENTIAL:
-            result = StaticNumericalAnalyzer._sequential_sum(samples, op.dtype)
-        elif op.reduction_order == ReductionOrder.TREE:
-            result = StaticNumericalAnalyzer._tree_sum(samples, op.dtype)
+        # 根据 op.dtype 决定量化方式
+        if op.dtype == "int8":
+            _, W_dq, _ = quantize_int8(W)
+        elif op.dtype == "fp16":
+            W_dq = W.astype(np.float16).astype(np.float32)
         else:
-            raise NotImplementedError(f"暂不支持 {op.reduction_order}")
+            W_dq = W  # fp32，误差为 0
 
-        error = abs(result - ref)
+        if isinstance(op, MatMulIR):
+            if op.input_data is None:
+                raise ValueError("MatMulIR 缺少 input_data")
+            x = op.input_data.astype(np.float32)
+            out_fp32 = np_linear(x, W, b)
+            out_q = np_linear(x, W_dq, b)
 
-        # int8 溢出检查：累加 K 个 int8 最大值是否超出 int32 范围
-        accum_overflow = (op.dtype == "int8" and op.K * 127 > 2**31 - 1)
+        elif isinstance(op, Conv2dIR):
+            if op.input_data is None:
+                raise ValueError("Conv2dIR 缺少 input_data")
+            x = op.input_data.astype(np.float32)
+            out_fp32 = conv2d(x, W, b)
+            out_q = conv2d(x, W_dq, b)
 
-        warnings = ()
-        if op.dtype in ("fp16", "bf16") and op.K > 1024:
-            warnings = (f"fp16 累加 K={op.K} 步，精度风险较高",)
+        else:
+            raise NotImplementedError(f"不支持 {type(op).__name__}")
 
+        error = np.abs(out_fp32 - out_q)
         return NumericalResult(
-            max_error=error,
-            mean_error=error,
-            reduction_order_used=op.reduction_order,
+            max_error=float(error.max()),
+            mean_error=float(error.mean()),
+            reduction_order_used=op.reduction_order or ReductionOrder.SEQUENTIAL,
             reference_order=ReductionOrder.SEQUENTIAL,
-            accum_overflow=accum_overflow,
-            warnings=warnings,
+            accum_overflow=False,
+            warnings=(),
         )
+    #     if op.reduction_order == ReductionOrder.SEQUENTIAL:
+    #         result = StaticNumericalAnalyzer._sequential_sum(samples, op.dtype)
+    #     elif op.reduction_order == ReductionOrder.TREE:
+    #         result = StaticNumericalAnalyzer._tree_sum(samples, op.dtype)
+    #     else:
+    #         raise NotImplementedError(f"暂不支持 {op.reduction_order}")
+
+    #     error = abs(result - ref)
+
+    #     # int8 溢出检查：累加 K 个 int8 最大值是否超出 int32 范围
+    #     accum_overflow = (op.dtype == "int8" and op.K * 127 > 2**31 - 1)
+
+    #     warnings = ()
+    #     if op.dtype in ("fp16", "bf16") and op.K > 1024:
+    #         warnings = (f"fp16 累加 K={op.K} 步，精度风险较高",)
+
+    #     return NumericalResult(
+    #         max_error=error,
+    #         mean_error=error,
+    #         reduction_order_used=op.reduction_order,
+    #         reference_order=ReductionOrder.SEQUENTIAL,
+    #         accum_overflow=accum_overflow,
+    #         warnings=warnings,
+    #     )
 
 class AnalysisPipeline:
     def __init__(self, analyzers: list[Analyzer]):

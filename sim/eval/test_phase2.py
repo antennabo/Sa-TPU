@@ -26,12 +26,12 @@ hw = HardwareConfig(mxu_dim=(8,8), sram_bytes=16*1024*1024,
 # 4. Pipeline（只跑 MatMulIR，Conv2dIR 支持留到后续）
 pipeline = AnalysisPipeline([RooflinePerfAnalyzer(), MemoryAnalyzer()])
 
-# for ir in irs:
-#     if isinstance(ir, MatMulIR):
-#         print(f"\n--- {ir.op_type} M={ir.M} N={ir.N} K={ir.K} ---")
-#         results = pipeline.run(ir, hw)
-#         for name, r in results.items():
-#             print(f"  {name}: {r}")
+for ir in irs:
+    if isinstance(ir, MatMulIR):
+        print(f"\n--- {ir.op_type} M={ir.M} N={ir.N} K={ir.K} ---")
+        results = pipeline.run(ir, hw)
+        for name, r in results.items():
+            print(f"  {name}: {r}")
 
 # matmul_ir = [ir for ir in irs if isinstance(ir, MatMulIR)][0]
 # # TilingTransform
@@ -49,11 +49,17 @@ pipeline = AnalysisPipeline([RooflinePerfAnalyzer(), MemoryAnalyzer()])
 # for name, r in results.items():
 #     print(f"  {name}: {r}")
 
-results = pipeline.run_graph(irs, hw)
-for layer, r in results.items():
-    print(f"{layer}: {r}")
+# results = pipeline.run_graph(irs, hw)
+# for layer, r in results.items():
+#     print(f"{layer}: {r}")
 
 from lowering import lower_graph
 lowered = lower_graph(irs)
 print("Lowered IR 数量:", len(lowered))
-print("Lowered IR 数量:", lowered)
+# print("Lowered IR 数量:", lowered)
+
+from quantize import quantize_graph
+
+quantized_irs = quantize_graph(irs)
+for ir in quantized_irs:
+    print(ir.op_type, ir.dtype)

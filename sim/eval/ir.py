@@ -14,6 +14,7 @@ class OpIR(ABC):
     op_type: str
     dtype: str # "fp32" / "int8"
 
+
 # --- 子类---
 @dataclass(frozen=True)
 class MatMulIR(OpIR):
@@ -25,6 +26,10 @@ class MatMulIR(OpIR):
     reduction_order: Optional[ReductionOrder] = None
     mapping:         Optional[dict] = None   # MXU 维度绑定
     schedule:        None           = None   # cycle-accurate 预留
+    
+    input_data: Optional[object] = None   # numpy array，NumericalAnalyzer 用
+    input_weight: Optional[object] = None  # numpy array [N, K]
+    bias:         Optional[object] = None  # numpy array [N]
 
 @dataclass(frozen=True)
 class Conv2dIR(OpIR):
@@ -42,6 +47,10 @@ class Conv2dIR(OpIR):
     reduction_order: Optional[ReductionOrder] = None
     mapping:         Optional[dict]           = None
     schedule:        None                     = None
+
+    input_data: Optional[object] = None   # numpy array，NumericalAnalyzer 用
+    input_weight: Optional[object] = None  # numpy array [N, K]
+    bias:         Optional[object] = None  # numpy array [N]
 
 @dataclass(frozen=True)
 class ElementwiseIR(OpIR):
