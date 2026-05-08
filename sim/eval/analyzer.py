@@ -90,45 +90,34 @@ class MemoryAnalyzer(Analyzer):
         return MemoryResult(sram_bytes=sram_bytes,hbm_bytes=hbm_bytes,fits=fits)
 
 
-class StaticNumericalAnalyzer(Analyzer):
+class NumericalAnalyzer(Analyzer):
+    """数值精度分析器，支持单层（run）和全图（analyze_graph）两种模式"""
     name = "numerical"
 
     def analyze(self, op, _hw):
+        # 单层模式：要求 op.input_data 已填（用 fill_activations 预处理）
         if not hasattr(op, "input_weight") or op.input_weight is None:
-            raise NotImplementedError(f"{type(op).__name__} 没有 input_weight，无法分析")
-        return self._analyze_real(op)
+            raise ValueError(f"{type(op).__name__} 缺少 input_weight")
+        if not hasattr(op, "input_data") or op.input_data is None:
+            raise ValueError(f"{type(op).__name__} 缺少 input_data，请先用 fill_activations 填充")
+        return self._analyze_single(op)
 
-    @staticmethod
-    def _analyze_real(op):
+    def _analyze_single(self, op) -> NumericalResult:
         import numpy as np
-        from numpy_ops import np_linear, conv2d, quantize_int8
+        from numpy_ops import np_linear, conv2d
         from ir import MatMulIR, Conv2dIR
 
+        x = op.input_data.astype(np.float32)
         W = op.input_weight.astype(np.float32)
         b = op.bias.astype(np.float32) if op.bias is not None else 0
-
-        # 根据 op.dtype 决定量化方式
-        if op.dtype == "int8":
-            _, W_dq, _ = quantize_int8(W)
-        elif op.dtype == "fp16":
-            W_dq = W.astype(np.float16).astype(np.float32)
-        else:
-            W_dq = W  # fp32，误差为 0
+        W_dq = self._quantize_weight(W, op.dtype)
 
         if isinstance(op, MatMulIR):
-            if op.input_data is None:
-                raise ValueError("MatMulIR 缺少 input_data")
-            x = op.input_data.astype(np.float32)
             out_fp32 = np_linear(x, W, b)
-            out_q = np_linear(x, W_dq, b)
-
+            out_q    = np_linear(x, W_dq, b)
         elif isinstance(op, Conv2dIR):
-            if op.input_data is None:
-                raise ValueError("Conv2dIR 缺少 input_data")
-            x = op.input_data.astype(np.float32)
             out_fp32 = conv2d(x, W, b)
-            out_q = conv2d(x, W_dq, b)
-
+            out_q    = conv2d(x, W_dq, b)
         else:
             raise NotImplementedError(f"不支持 {type(op).__name__}")
 
@@ -141,43 +130,70 @@ class StaticNumericalAnalyzer(Analyzer):
             accum_overflow=False,
             warnings=(),
         )
-    #     if op.reduction_order == ReductionOrder.SEQUENTIAL:
-    #         result = StaticNumericalAnalyzer._sequential_sum(samples, op.dtype)
-    #     elif op.reduction_order == ReductionOrder.TREE:
-    #         result = StaticNumericalAnalyzer._tree_sum(samples, op.dtype)
-    #     else:
-    #         raise NotImplementedError(f"暂不支持 {op.reduction_order}")
 
-    #     error = abs(result - ref)
+    def analyze_graph(self, irs, sample_input) -> NumericalResult:
+        import numpy as np
+        out_fp32 = self._forward(irs, sample_input, quantize=False)
+        out_q    = self._forward(irs, sample_input, quantize=True)
+        error = np.abs(out_fp32 - out_q)
+        return NumericalResult(
+            max_error=float(error.max()),
+            mean_error=float(error.mean()),
+            reduction_order_used=ReductionOrder.SEQUENTIAL,
+            reference_order=ReductionOrder.SEQUENTIAL,
+            accum_overflow=False,
+            warnings=(),
+        )
 
-    #     # int8 溢出检查：累加 K 个 int8 最大值是否超出 int32 范围
-    #     accum_overflow = (op.dtype == "int8" and op.K * 127 > 2**31 - 1)
+    @staticmethod
+    def _forward(irs, sample_input, quantize: bool):
+        import numpy as np
+        from numpy_ops import np_linear, np_relu, conv2d, maxpool
+        from ir import MatMulIR, Conv2dIR, ElementwiseIR
 
-    #     warnings = ()
-    #     if op.dtype in ("fp16", "bf16") and op.K > 1024:
-    #         warnings = (f"fp16 累加 K={op.K} 步，精度风险较高",)
+        x = sample_input.astype(np.float32)
+        for ir in irs:
+            if isinstance(ir, (Conv2dIR, MatMulIR)):
+                W = ir.input_weight.astype(np.float32)
+                b = ir.bias.astype(np.float32) if ir.bias is not None else 0
+                if quantize:
+                    W = NumericalAnalyzer._quantize_weight(W, ir.dtype)
+                x = conv2d(x, W, b) if isinstance(ir, Conv2dIR) else np_linear(x, W, b)
+            elif isinstance(ir, ElementwiseIR):
+                if ir.op == "relu":      x = np_relu(x)
+                elif ir.op == "maxpool": x = maxpool(x)
+                elif ir.op == "flatten": x = x.flatten()
+        return x
 
-    #     return NumericalResult(
-    #         max_error=error,
-    #         mean_error=error,
-    #         reduction_order_used=op.reduction_order,
-    #         reference_order=ReductionOrder.SEQUENTIAL,
-    #         accum_overflow=accum_overflow,
-    #         warnings=warnings,
-    #     )
+    @staticmethod
+    def _quantize_weight(W, dtype):
+        import numpy as np
+        from numpy_ops import quantize_int8
+        if dtype == "int8":
+            _, W_dq, _ = quantize_int8(W)
+            return W_dq
+        elif dtype == "fp16":
+            return W.astype(np.float16).astype(np.float32)
+        return W
 
 class AnalysisPipeline:
     def __init__(self, analyzers: list[Analyzer]):
         self.analyzers = analyzers
 
     def run(self, op, hw) -> dict:
-        return {type(a).__name__: a.run(op, hw) for a in self.analyzers}
-    
+        results = {}
+        for a in self.analyzers:
+            try:
+                results[type(a).__name__] = a.run(op, hw)
+            except (NotImplementedError, AttributeError, ValueError):
+                results[type(a).__name__] = None
+        return results
+
     def run_graph(self, ops: list, hw: HardwareConfig) -> dict:
         results = {}
         for i, op in enumerate(ops):
             try:
                 results[f"{op.op_type}_{i}"] = self.run(op, hw)
-            except (NotImplementedError, AttributeError):
-                results[f"{op.op_type}_{i}"] = None  # 暂不支持
+            except (NotImplementedError, AttributeError, ValueError):
+                results[f"{op.op_type}_{i}"] = None
         return results

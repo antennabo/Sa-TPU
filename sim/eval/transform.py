@@ -28,3 +28,28 @@ class MappingTransform(Transform):
 
     def transform(self, op, mapping: dict, reduction_order: ReductionOrder) -> OpIR:
         return dataclasses.replace(op, mapping=mapping, reduction_order=reduction_order)
+
+
+import dataclasses, numpy as np
+from numpy_ops import conv2d, np_linear, np_relu, maxpool
+from ir import Conv2dIR, MatMulIR, ElementwiseIR
+
+def fill_activations(irs: list, x) -> list:
+    """逐层传播激活，填入每个计算层的 input_data"""
+    result = []
+    x = x.astype(np.float32)
+    for ir in irs:
+        if isinstance(ir, Conv2dIR):
+            result.append(dataclasses.replace(ir, input_data=x))
+            x = np_relu(conv2d(x, ir.input_weight, ir.bias))
+        elif isinstance(ir, MatMulIR):
+            result.append(dataclasses.replace(ir, input_data=x))
+            x = np_relu(np_linear(x, ir.input_weight, ir.bias))
+        elif isinstance(ir, ElementwiseIR):
+            result.append(ir)
+            if ir.op == "relu":    x = np_relu(x)
+            elif ir.op == "maxpool": x = maxpool(x)
+            elif ir.op == "flatten": x = x.flatten()
+        else:
+            result.append(ir)
+    return result

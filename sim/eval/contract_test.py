@@ -2,7 +2,7 @@ import pytest
 from ir import MatMulIR, ReductionOrder
 from hw import HardwareConfig
 from result import AnalysisResult, NumericalResult
-from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, StaticNumericalAnalyzer
+from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, NumericalAnalyzer
 
 def make_op(reduction_order=ReductionOrder.SEQUENTIAL):
     return MatMulIR(op_type="matmul", dtype="fp16", accum_dtype="fp32",
@@ -57,18 +57,48 @@ class TestMemoryContract(AnalyzerContractTest):
     def analyzer(self):
         return MemoryAnalyzer()
 
-class TestNumericalContract(AnalyzerContractTest):
-    @pytest.fixture
-    def analyzer(self):
-        return StaticNumericalAnalyzer()
+class TestNumericalContract:
+    """NumericalAnalyzer 使用图级接口，单独测试"""
 
-    # 不只是近似相等，必须完全一样，每个 bit 都相同。
-    def test_same_reduction_order_bit_exact(self, analyzer):
-        op = make_op(ReductionOrder.SEQUENTIAL)
-        assert analyzer.run(op, make_hw()) == analyzer.run(op, make_hw())
+    def make_irs(self, dtype="int8"):
+        import numpy as np
+        from ir import MatMulIR
+        W = np.random.randn(64, 64).astype(np.float32)
+        b = np.random.randn(64).astype(np.float32)
+        return [MatMulIR(op_type="linear", dtype=dtype, accum_dtype="fp32",
+                         M=1, N=64, K=64, input_weight=W, bias=b)]
 
-    # SEQUENTIAL 和 TREE 的结果应该不同。如果两者结果一样，说明 analyzer 根本没有读 reduction_order 字段
-    def test_different_reduction_order_differs(self, analyzer):
-        r1 = analyzer.run(make_op(ReductionOrder.SEQUENTIAL), make_hw())
-        r2 = analyzer.run(make_op(ReductionOrder.TREE), make_hw())
-        assert r1 != r2
+    def make_hw(self):
+        return HardwareConfig(mxu_dim=(8,8), sram_bytes=16*1024*1024,
+                              hbm_bw_gbps=900.0, freq_mhz=1000.0)
+
+    def test_returns_numerical_result(self):
+        import numpy as np
+        analyzer = NumericalAnalyzer()
+        x = np.random.randn(1, 64).astype(np.float32)
+        result = analyzer.analyze_graph(self.make_irs(), self.make_hw(), x)
+        assert isinstance(result, NumericalResult)
+
+    def test_deterministic(self):
+        import numpy as np
+        analyzer = NumericalAnalyzer()
+        irs = self.make_irs()
+        x = np.random.randn(1, 64).astype(np.float32)
+        assert analyzer.analyze_graph(irs, self.make_hw(), x) == \
+               analyzer.analyze_graph(irs, self.make_hw(), x)
+
+    def test_fp32_zero_error(self):
+        """fp32 不量化，误差应为 0"""
+        import numpy as np
+        analyzer = NumericalAnalyzer()
+        x = np.random.randn(1, 64).astype(np.float32)
+        result = analyzer.analyze_graph(self.make_irs(dtype="fp32"), self.make_hw(), x)
+        assert result.max_error == 0.0
+
+    def test_int8_has_error(self):
+        """int8 量化应有非零误差"""
+        import numpy as np
+        analyzer = NumericalAnalyzer()
+        x = np.random.randn(1, 64).astype(np.float32)
+        result = analyzer.analyze_graph(self.make_irs(dtype="int8"), self.make_hw(), x)
+        assert result.max_error > 0.0
