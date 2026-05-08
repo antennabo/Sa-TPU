@@ -6,6 +6,25 @@ def quantize_int8(W):
     W_dequant = W_int8.astype(np.float32) * scale
     return W_int8, W_dequant, scale
 
+def quantize_fp16(W):
+    W_fp16 = W.astype(np.float16)
+    W_dequant = W_fp16.astype(np.float32)
+    return W_fp16, W_dequant
+
+def quantize_weight(W, dtype):
+    match dtype:
+        case "int8":
+            _, W_dq, _ = quantize_int8(W)
+            return W_dq
+        case "fp16":
+            _, W_dq = quantize_fp16(W)
+            return W_dq
+        case "int4":
+            # TODO
+            raise NotImplementedError("int4 暂不支持")
+        case _:
+            return W  # fp32，无损
+
 def np_linear(x, W, b):
     return x @ W.T + b
 

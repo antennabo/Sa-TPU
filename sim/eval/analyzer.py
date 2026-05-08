@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
-from ir import OpIR, MatMulIR, ReductionOrder
+from ir import OpIR, MatMulIR, Conv2dIR, ElementwiseIR, ReductionOrder
 from hw import HardwareConfig
 from result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
-import math
-import random
+from numpy_ops import quantize_weight, np_linear, conv2d, np_relu, maxpool
+import numpy as np
 
 class Analyzer(ABC):
     name: str  # 子类定义，例如 "roofline" / "memory"
@@ -126,14 +126,10 @@ class NumericalAnalyzer(Analyzer):
         return self._analyze_single(op)
 
     def _analyze_single(self, op) -> NumericalResult:
-        import numpy as np
-        from numpy_ops import np_linear, conv2d
-        from ir import MatMulIR, Conv2dIR
-
         x = op.input_data.astype(np.float32)
         W = op.input_weight.astype(np.float32)
         b = op.bias.astype(np.float32) if op.bias is not None else 0
-        W_dq = self._quantize_weight(W, op.dtype)
+        W_dq = quantize_weight(W, op.dtype)
 
         if isinstance(op, MatMulIR):
             out_fp32 = np_linear(x, W, b)
@@ -155,7 +151,7 @@ class NumericalAnalyzer(Analyzer):
         )
 
     def analyze_graph(self, irs, sample_input) -> NumericalResult:
-        import numpy as np
+
         out_fp32 = self._forward(irs, sample_input, quantize=False)
         out_q    = self._forward(irs, sample_input, quantize=True)
         error = np.abs(out_fp32 - out_q)
@@ -170,34 +166,19 @@ class NumericalAnalyzer(Analyzer):
 
     @staticmethod
     def _forward(irs, sample_input, quantize: bool):
-        import numpy as np
-        from numpy_ops import np_linear, np_relu, conv2d, maxpool
-        from ir import MatMulIR, Conv2dIR, ElementwiseIR
-
         x = sample_input.astype(np.float32)
         for ir in irs:
             if isinstance(ir, (Conv2dIR, MatMulIR)):
                 W = ir.input_weight.astype(np.float32)
                 b = ir.bias.astype(np.float32) if ir.bias is not None else 0
                 if quantize:
-                    W = NumericalAnalyzer._quantize_weight(W, ir.dtype)
+                    W = quantize_weight(W, ir.dtype)
                 x = conv2d(x, W, b) if isinstance(ir, Conv2dIR) else np_linear(x, W, b)
             elif isinstance(ir, ElementwiseIR):
                 if ir.op == "relu":      x = np_relu(x)
                 elif ir.op == "maxpool": x = maxpool(x)
                 elif ir.op == "flatten": x = x.flatten()
         return x
-
-    @staticmethod
-    def _quantize_weight(W, dtype):
-        import numpy as np
-        from numpy_ops import quantize_int8
-        if dtype == "int8":
-            _, W_dq, _ = quantize_int8(W)
-            return W_dq
-        elif dtype == "fp16":
-            return W.astype(np.float16).astype(np.float32)
-        return W
 
 class AnalysisPipeline:
     def __init__(self, analyzers: list[Analyzer]):

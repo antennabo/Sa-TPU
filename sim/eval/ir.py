@@ -5,15 +5,14 @@ from typing import Optional
 
 # --- 枚举 ---
 class ReductionOrder(Enum):
-    SEQUENTIAL = "sequential"
-    TREE       = "tree"
+    SEQUENTIAL = "sequential"# systolic array
+    TREE       = "tree" # do not support now
 
 # --- 抽象基类（只放共性字段，不放方法）---
 @dataclass(frozen=True)
 class OpIR(ABC):
     op_type: str
     dtype: str # "fp32" / "int8"
-
 
 # --- 子类---
 @dataclass(frozen=True)
