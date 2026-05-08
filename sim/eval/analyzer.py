@@ -57,6 +57,29 @@ class RooflinePerfAnalyzer(Analyzer):
             confidence="approximate",
         )
     
+    def analyze_linear(self, op, hw):
+        pass
+
+    def analyze_conv(self, op, hw):
+
+        if op.dtype in ("fp16", "int16"):
+            dtype_bytes = 2
+        elif op.dtype == "int8":
+            dtype_bytes = 1
+        elif op.dtype == "int4":
+            dtype_bytes = 0.5
+        else:
+            dtype_bytes = 4
+
+        H_out = (op.H + 2*op.padding - op.R) // op.stride + 1#(op.padding)
+        W_out = (op.W + 2*op.padding - op.S) // op.stride + 1
+
+        ops = H_out * W_out * op.R * op.S * op.C * op.K * op.N
+        # op.N*op.K*H_out*W_out 输出 feature map
+        # K*C*R*S 卷积核 大小
+        # N*C*H*W 输入Feature Map
+        # bytes     = (N*C*H*W + K*C*R*S + op.N*op.K*H_out*W_out) * dtype_bytes
+
 class MemoryAnalyzer(Analyzer):
     # TODO: 跨层数据复用分析 - 中间 tensor 若能驻留 SRAM，hbm_bytes 可减少
     # 当前 hbm_bytes 为悲观估计（假设每层都从 HBM 读写）

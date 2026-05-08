@@ -42,7 +42,9 @@ class Conv2dIR(OpIR):
     K: int # filter num
     R: int # kernel height
     S: int # kernel width
-
+    
+    padding: int = 1
+    stride:  int = 1
     tile:            Optional[dict]           = None
     reduction_order: Optional[ReductionOrder] = None
     mapping:         Optional[dict]           = None
