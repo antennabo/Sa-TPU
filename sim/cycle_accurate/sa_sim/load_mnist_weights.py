@@ -39,8 +39,8 @@ def _quantize_int8(weight_f32):
 
 
 def load_mnist_weights(
-    data_dir="data/mnist",
-    out_path="phase0_golden/mnist_weights.npz",
+    data_dir=None,
+    out_path=None,
     retrain=False,
 ):
     """
@@ -55,7 +55,15 @@ def load_mnist_weights(
     Returns:
         dict with the four arrays above
     """
-    out_path = Path(out_path)
+    if out_path is None:
+        out_path = Path(__file__).parent.parent / "weights" / "mnist_weights.npz"
+    else:
+        out_path = Path(out_path)
+        
+    if data_dir is None:
+        data_dir = Path(__file__).parent.parent / "data"
+    else:
+        data_dir = Path(data_dir)
 
     if out_path.exists() and not retrain:
         print(f"Loading cached weights from {out_path}")

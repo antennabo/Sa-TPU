@@ -1,5 +1,6 @@
 import sys
 import os
+from pathlib import Path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
 import numpy as np
@@ -10,8 +11,8 @@ from sim.cycle_accurate.sa_sim.matmul_api import matmul
 from sim.cycle_accurate.sa_sim.activation import relu
 from sim.cycle_accurate.sa_sim.load_mnist_weights import load_mnist_weights
 
-DATA_DIR = "data/mnist"
-WEIGHTS_PATH = "phase0_golden/mnist_weights.npz"
+DATA_DIR     = Path(__file__).parent.parent / "data"
+WEIGHTS_PATH = Path(__file__).parent.parent / "weights" / "mnist_weights.npz"
 ACCURACY_THRESHOLD = 0.85
 N_TEST = 1000
 
