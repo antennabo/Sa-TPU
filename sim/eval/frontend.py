@@ -59,7 +59,8 @@ def export_to_ir(exported, dtype="fp32") -> list:
             shape = tuple(node.meta["val"].shape)
             irs.append(ElementwiseIR(op_type="elementwise", dtype="fp32", op="maxpool", shape=shape))
 
-        elif "view" in name:
+        # elif "view" in name:
+        elif "view" in name or "flatten" in name:
             shape = tuple(node.meta["val"].shape)
             irs.append(ElementwiseIR(op_type="elementwise", dtype="fp32", op="flatten", shape=shape))
     return irs
