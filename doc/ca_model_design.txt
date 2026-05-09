@@ -70,17 +70,22 @@ cycle-accurate 仿真，使每个操作的延迟以时钟周期为单位建模�
 核心思路：逐 cycle 推进仿真状态机，每个 cycle 描述硬件在做什么，
 最终统计 total_cycles，而不是代入公式直接算出结果。
 
-每个模块（PE、SRAM buffer、accumulator）每个 cycle 执行两段式更新：
+每个模块（PE、SRAM buffer、accumulator）内部维护两个变量：
 
-  1. compute_next()：只读当前状态，计算出下一状态（不写任何寄存器）
-  2. commit()：将 compute_next 的结果统一写入（不读任何邻居状态）
+  - state：当前 cycle 的状态，所有模块在本 cycle 内只读此变量
+  - next_state：compute_next() 写入的下一 cycle 状态，commit() 后生效
+
+每个 cycle 执行两段式更新：
+
+  1. compute_next()：只读 state，将计算结果写入 next_state（不修改 state）
+  2. commit()：state = next_state（不做任何计算）
 
   伪代码：
     for cycle in range(total_cycles):
         for module in all_modules:
-            module.compute_next()    # 所有模块先算
+            module.compute_next()    # 读 state，写 next_state
         for module in all_modules:
-            module.commit()          # 所有模块再写
+            module.commit()          # state = next_state
         cycle += 1
 
   意义：同一 cycle 内所有模块看到的都是本 cycle 开始时的状态，
