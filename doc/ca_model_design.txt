@@ -1,0 +1,281 @@
+================================================================
+Cycle-Accurate Simulation Design
+La-TPU Project
+================================================================
+
+1. 目标
+----------------------------------------------------------------
+在 phase0_J 现有 golden reference（功能正确）基础上，扩展为
+cycle-accurate 仿真，使每个操作的延迟以时钟周期为单位建模。
+
+仿真结果通过统一接口与 sim_T 的 RooflinePerfAnalyzer 对比验证，
+验证对象包括 MatMul 和 Conv2d。
+
+----------------------------------------------------------------
+2. 现有基础（phase0_J）
+----------------------------------------------------------------
+- PE：INT8×INT8→INT32 MAC，weight stationary
+- SystolicArray：N×N PE 阵列
+- tiling：任意矩阵分块，padding 到 N 的倍数
+- matmul_api：对外接口
+
+缺失：无 cycle 计数，无内存延迟建模，无流水线建模
+
+----------------------------------------------------------------
+3. 硬件架构
+----------------------------------------------------------------
+
+3.1 整体结构
+
+    HBM
+     │
+  DMA Controller
+     │
+  On-Chip SRAM (scratchpad)
+     │         │
+  Weight      Activation
+  Buffer      Buffer
+     │         │
+  ┌──┴─────────┴──┐
+  │  Systolic     │
+  │  Array (MXU)  │
+  │  N × N PEs    │
+  └──────┬────────┘
+         │
+    Accumulator Buffer (INT32)
+         │
+    Post-Processing (ReLU, requantize)
+         │
+    Output Buffer
+
+3.2 PE 阵列
+- 大小：N×N（默认 8×8，与 HardwareConfig.mxu_dim 对齐）
+- 数据类型：INT8 × INT8 → INT32 累加
+- Dataflow：Weight Stationary
+- 每周期：每个 PE 完成 1 次 MAC
+
+3.3 内存层次（延迟模型）
+| 层次         | 容量        | 访问延迟   |
+|-------------|-------------|-----------|
+| HBM         | 无限（外部）| hbm_latency_cycles（可配置）|
+| On-chip SRAM| sram_bytes  | 1 cycle   |
+| PE 寄存器   | 1 weight    | 0 cycle   |
+
+----------------------------------------------------------------
+4. Cycle-Accurate 建模
+----------------------------------------------------------------
+
+4.0 仿真更新协议
+
+核心思路：逐 cycle 推进仿真状态机，每个 cycle 描述硬件在做什么，
+最终统计 total_cycles，而不是代入公式直接算出结果。
+
+每个模块（PE、SRAM buffer、accumulator）每个 cycle 执行两段式更新：
+
+  1. compute_next()：只读当前状态，计算出下一状态（不写任何寄存器）
+  2. commit()：将 compute_next 的结果统一写入（不读任何邻居状态）
+
+  伪代码：
+    for cycle in range(total_cycles):
+        for module in all_modules:
+            module.compute_next()    # 所有模块先算
+        for module in all_modules:
+            module.commit()          # 所有模块再写
+        cycle += 1
+
+  意义：同一 cycle 内所有模块看到的都是本 cycle 开始时的状态，
+  避免仿真顺序影响结果（等价于数字电路中触发器的同步更新语义）。
+
+4.1 模块间通信（Controller）- tbd
+
+  各模块只暴露状态端口，不直接感知邻居。Controller 居中协调，
+  每个 cycle 读所有模块的状态，决定发什么指令。
+
+  模块端口约定：
+    每个模块有两类端口：
+    - 输出端口（只读）：当前状态，供 Controller 和其他模块观察
+    - 输入端口（只写）：Controller 在 commit() 后写入下一 cycle 的指令
+
+  Controller 职责：
+    - 读 MXU.state、WeightBuffer.state
+    - 根据状态机规则决定下一条指令（LOAD_TILE / START_COMPUTE / WRITEBACK）
+    - 将指令写入各模块的 input_cmd
+
+  每个 cycle 的执行顺序：
+
+    # 1. 所有模块基于当前状态和 input_cmd 计算下一状态
+    controller.compute_next()
+    mxu.compute_next()
+    weight_buffer.compute_next()
+    accumulator.compute_next()
+
+    # 2. 所有模块统一提交
+    controller.commit()
+    mxu.commit()
+    weight_buffer.commit()
+    accumulator.commit()
+
+    # 3. Controller 发出下一 cycle 的指令（写入各模块 input_cmd）
+    controller.dispatch()
+
+4.2 Conv2d 预处理（im2col）
+
+  IR 层 Conv2dIR 保持为一等算子，不降为 MatMul。
+  进入 cycle 仿真前，先将 Conv2dIR 的空间参数展开为等价 MatMul 尺寸：
+
+    M = H_out * W_out * N     （输出空间位置数）
+    K = C * R * S             （每个输出位置的 reduction 维度）
+    N = K_filter              （输出通道数）
+
+  其中：
+    H_out = (H + 2*padding - R) // stride + 1
+    W_out = (W + 2*padding - S) // stride + 1
+
+  展开只在 CycleAccurateAnalyzer 内部做，不修改 IR，不产生新的 IR 节点。
+  展开后直接复用 MatMul 的仿真逻辑。
+
+4.4 stall 建模（Phase C 预留）
+
+  当前 Phase A/B：假设 SRAM 总命中，无 stall。
+  PE 状态机预留 STALL 状态，Phase C 引入 HBM latency 时启用：
+
+    if sram_miss:
+        pe_array.state = STALL
+        cycle += hbm_latency_cycles   # 等待 DMA 搬运完成
+        pe_array.state = LOADING
+
+----------------------------------------------------------------
+5. 统一接口设计
+----------------------------------------------------------------
+
+5.1 CycleAccurateAnalyzer
+
+继承 sim_T 的 Analyzer 基类，实现相同接口：
+
+  class CycleAccurateAnalyzer(Analyzer):
+      name = "cycle_accurate"
+
+      def analyze(self, op: OpIR, hw: HardwareConfig) -> PerfResult:
+          # 支持 MatMulIR 和 Conv2dIR
+          cycles = self._count_cycles(op, hw)
+          latency_ns = cycles / (hw.freq_mhz * 1e6) * 1e9
+          utilization = peak_compute_cycles / cycles
+          return PerfResult(latency_ns=latency_ns, utilization=utilization, ...)
+
+5.2 与 RooflinePerfAnalyzer 对比
+
+  pipeline = AnalysisPipeline([RooflinePerfAnalyzer(), CycleAccurateAnalyzer()])
+  results = pipeline.run_graph(irs, hw)
+
+  对比指标：
+  - latency_ns：Roofline（理论下界）vs CycleAccurate（实际估算）
+  - utilization：差距反映流水线效率损失
+
+5.3 验证标准
+
+  cycle_accurate_latency >= roofline_latency  # cycle-accurate 永远不低于理论下界
+  ratio = cycle_accurate / roofline            # 目标：ratio < 2.0（初期）
+
+----------------------------------------------------------------
+6. 仿真驱动方式
+----------------------------------------------------------------
+
+两种主流实现结构，各有权衡：
+
+6.1 时间驱动（Time-Driven / Clock-Driven）
+
+  核心思路：
+    每个仿真步骤推进 1 个时钟周期，所有组件在每个 cycle 都被更新一次。
+
+  伪代码：
+    for cycle in range(total_cycles):
+        pe_array.tick(cycle)
+        memory.tick(cycle)
+        controller.tick(cycle)
+
+  优点：
+  - 实现简单，逻辑直观
+  - 容易加 cycle 计数器和利用率统计
+  - 适合流水线建模（每个 cycle 推进一格）
+
+  缺点：
+  - 空闲周期（DMA stall、HBM latency 等待）也要 tick，CPU 时间浪费
+  - total_cycles 很大时（如大矩阵），仿真慢
+
+  适用场景：
+    cycle 数量有限，流水线结构固定，优先关注正确性
+    → 本项目 Phase A/B 推荐使用此方案
+
+6.2 事件驱动（Event-Driven）
+
+  核心思路：
+    维护一个事件队列（按 cycle 排序）。仿真时钟直接跳到下一个事件发生的 cycle，
+    跳过所有空闲周期。
+
+  伪代码：
+    event_queue = [(0, "weight_load_done"), (K, "compute_done"), ...]
+    while event_queue:
+        cycle, event = heappop(event_queue)
+        handle(event)        # 可能 push 新事件
+
+  优点：
+  - 大量空闲周期时效率高（DMA 等待、多核调度）
+  - 适合建模并发资源竞争（多个 tile 争用同一 HBM 端口）
+
+  缺点：
+  - 实现复杂：需要手动管理事件依赖和时序
+  - 调试困难，事件顺序错误不易发现
+
+  适用场景：
+    多核 / 多 MXU 并行，建模总线争用，Phase C/D 内存延迟优化
+
+6.3 本项目选择
+
+  Phase A/B：时间驱动
+    逐 cycle 推进仿真，每个 cycle 更新 PE 状态、流水线寄存器、累加器，
+    最终统计 total_cycles 和利用率作为输出。
+    RooflinePerfAnalyzer 是纯解析模型（公式），与之对比验证，两者不是同一层次。
+
+  Phase C/D（预留）：可扩展为事件驱动
+    引入 HBM stall 和多资源竞争后，考虑切换或混合使用。
+
+----------------------------------------------------------------
+7. 实现步骤
+----------------------------------------------------------------
+
+Phase A：MatMul cycle 建模
+  □ 给 PE 加 cycle 计数器
+  □ 给 SystolicArray 加 cycle 统计
+  □ 实现 CycleAccurateAnalyzer（只支持 MatMulIR）
+  □ 和 RooflinePerfAnalyzer 对比验证
+
+Phase B：Conv2d cycle 建模
+  □ im2col 展开逻辑（仅用于 cycle 计算）
+  □ CycleAccurateAnalyzer 支持 Conv2dIR
+
+Phase C：内存延迟建模
+  □ HBM stall 计入 cycle
+  □ SRAM hit/miss 模型 - nc
+
+Phase D：流水线优化
+  □ weight prefetch 流水
+  □ 计算/内存重叠
+
+----------------------------------------------------------------
+7. 待决策
+----------------------------------------------------------------
+- HBM 延迟参数如何标定（参考真实 TPU 数据还是假设）
+- SystolicArray 大小是否支持非方形（8×16 等） - 暂时方形
+- 多 batch 并行策略
+
+----------------------------------------------------------------
+8. 文件规划
+----------------------------------------------------------------
+
+sim/
+├── cycle_accurate/
+│   ├── pe.py              # 扩展 phase0_J PE，加 cycle 计数
+│   ├── systolic_array.py  # 扩展，加 cycle 统计
+│   ├── tiling.py          # 复用或扩展
+│   └── cycle_analyzer.py  # CycleAccurateAnalyzer，对接 sim_T 接口
+└── eval/                  # 现有 sim_T 框架（不动）
