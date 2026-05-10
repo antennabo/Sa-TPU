@@ -1,0 +1,744 @@
+================================================================================
+                       TPU 计算模型建模架构设计文档
+================================================================================
+
+文档目的：定义一套可演进的 TPU 建模软件架构，支持架构探索（DSE）和
+         部署前精度/性能预估两类场景，从单层起步，预留 cycle-accurate
+         模型接入路径。
+
+
+================================================================================
+1. 总体设计思路
+================================================================================
+
+1.1 架构选型
+------------
+采用「同一 IR + 多解析器（Analyzer）」的架构，而非「IR + 多功能函数」。
+
+核心原则：
+  - IR 只承载结构信息和必要属性，不承载评估逻辑
+  - 评估能力按关注点（性能、内存、精度、利用率…）拆分为独立 Analyzer
+  - 各 Analyzer 接口统一、行为一致、可组合
+
+1.2 选型理由
+------------
+  (1) TPU 评估维度天然多元：数学等价性、cycle-accurate 性能、SRAM/HBM
+      带宽、MXU 利用率、量化误差等，抽象层次和数据需求差异大，不应耦合。
+  (2) 性能模型与精度模型演进节奏不同。性能模型随硬件 spec 变化，精度
+      模型随算法变化，解耦后可各自独立迭代。
+  (3) 可组合性：例如「量化后的性能评估」= 量化 pass + 性能 pass 串联，
+      而非在每个层函数中加分支。
+  (4) 与编译器主流实践一致（MLIR / TVM / XLA 的 Pass 模型）。
+
+1.3 适用场景
+------------
+本架构同时服务两类场景，并通过 Analyzer 组合切换：
+
+  场景 A：架构探索（DSE）
+    - 硬件参数为变量，需扫描成千上万配置
+    - 评估速度优先，精度次之
+    - 典型组合：[Roofline 性能, 内存, 利用率]
+
+  场景 B：部署前预估
+    - 硬件参数固定，模型固定
+    - 精度优先，速度可放宽
+    - 典型组合：[Cycle-accurate 性能, 数值精度]
+
+
+================================================================================
+2. 类规划与继承关系
+================================================================================
+
+2.1 总体组织
+------------
+分四组：IR / 硬件描述 / Analyzer / Result。
+继承尽量扁平（不超过 3 层），层间关系优先用组合（has-a），少用继承（is-a）。
+
+2.2 IR 类
+---------
+    OpIR (抽象基类)
+    ├── MatMulIR
+    ├── Conv2DIR
+    └── ElementwiseIR
+
+  - 基类承载共性：op_type、input_shapes、output_shape、dtype、
+    tile（可选）、mapping（可选）、schedule（可选，为 cycle-accurate 预留）
+  - 子类承载特有形状语义（Conv 的 R/S/stride/padding，MatMul 的 M/N/K）
+  - 关键约束：OpIR 子类只承载数据，不承载评估方法
+
+2.3 硬件描述类
+--------------
+    HardwareConfig（数据类，无继承）
+
+  - 单层阶段一个类即可
+  - 包含基础字段（所有模型共用）和可选 microarch 字段（cycle-accurate 用）
+  - 多核扩展时通过组合演进：HardwareConfig 包含 List[CoreConfig]
+
+2.4 Analyzer 体系（核心）
+-------------------------
+    Analyzer (抽象基类)
+    ├── PerfAnalyzer (抽象)
+    │   ├── RooflinePerfAnalyzer
+    │   ├── AnalyticalPerfAnalyzer
+    │   └── CycleAccuratePerfAnalyzer    （中期接入）
+    ├── MemoryAnalyzer
+    │   └── SRAMMemoryAnalyzer
+    ├── NumericalAnalyzer
+    │   └── StaticNumericalAnalyzer
+    └── UtilizationAnalyzer
+
+  - 中间抽象层定义「做什么」，叶子层定义「怎么做」
+  - 新增实现（如 SimulationPerfAnalyzer）时，调用方代码无需修改
+
+2.5 Result 类
+-------------
+    AnalysisResult (基类)
+    ├── PerfResult        （latency, utilization, 可选 cycle 详情）
+    ├── MemoryResult      （sram_bytes, hbm_bytes, fits…）
+    └── NumericalResult   （max_error, warnings…）
+
+  - 每个 Analyzer 配套一个 Result 类
+  - 严禁用 dict 作为返回值（字段失控、无 IDE 支持）
+
+2.6 继承的边界
+--------------
+  - 仅 is-a 用继承，has-a 用组合
+  - 不要为「能力共享」设计 Mixin 基类（如 HardwareAware），通过传参解决
+  - 继承深度上限 3 层
+
+
+================================================================================
+3. Analyzer 行为一致性保障（四层防护）
+================================================================================
+
+3.1 第一层：统一签名 + 抽象基类（模板方法模式）
+------------------------------------------------
+所有 Analyzer 强制实现统一接口，对外只暴露 run()。
+
+    class Analyzer(ABC):
+        name: str
+
+        @abstractmethod
+        def analyze(self, ir: OpIR, hw: HardwareConfig) -> AnalysisResult:
+            ...
+
+        def validate_input(self, ir, hw) -> None:
+            # 通用前置检查
+            ...
+
+        def run(self, ir, hw) -> AnalysisResult:
+            # 模板流程：校验 -> 分析 -> 后置检查
+            self.validate_input(ir, hw)
+            result = self.analyze(ir, hw)
+            self._postcheck(result)
+            return result
+
+  好处：日志、计时、异常包装、校验逻辑全部集中在基类，所有子类天然一致。
+
+3.2 第二层：纯函数语义
+----------------------
+强制 Analyzer 无副作用：
+  - 不修改 IR
+  - 不修改 HardwareConfig
+  - 不依赖外部可变状态
+  - 相同输入 -> 相同输出
+
+实现：OpIR / HardwareConfig 用 frozen dataclass（Python）或 const ref（C++）。
+收益：可并行、可缓存、DSE 反复调用结果可复现。
+
+3.3 第三层：契约测试（contract test）
+-------------------------------------
+所有 Analyzer 子类必须通过统一测试集：
+
+    class AnalyzerContractTest:
+        analyzer_cls = None
+        def test_returns_correct_result_type(self): ...
+        def test_does_not_mutate_ir(self): ...
+        def test_does_not_mutate_hw(self): ...
+        def test_deterministic(self): ...
+        def test_handles_missing_tile(self): ...
+
+新增 Analyzer 必须继承此测试类。文档约定不可靠，代码强制可靠。
+
+3.4 第四层：Pipeline 编排
+-------------------------
+DSE 与部署预估只是 Analyzer 列表不同，Pipeline 本身不变：
+
+    class AnalysisPipeline:
+        def __init__(self, analyzers: list[Analyzer]):
+            self.analyzers = analyzers
+
+        def run(self, ir, hw) -> dict[str, AnalysisResult]:
+            return {a.name: a.run(ir, hw) for a in self.analyzers}
+
+3.5 Analyzer 间依赖处理
+-----------------------
+若 Analyzer A 需要 Analyzer B 的结果，禁止互相直接依赖。两种处理：
+
+  方案一（推荐）：将共享计算下沉为 IR 的 attribute，由独立 pre-pass 计算。
+                  类似 MLIR 的做法。
+  方案二（节制使用）：通过 Pipeline context 显式传递上游结果。
+
+优先方案一，避免 Analyzer 之间隐式耦合。
+
+
+================================================================================
+4. 单层（Single Layer）阶段实现方案
+================================================================================
+
+4.1 范围
+--------
+  - 单个 op（MatMul 或 Conv2D 起步）
+  - 单 MXU + 本地 SRAM + 一条 HBM 带宽
+  - 不涉及多核、片间互联、跨层数据复用
+
+4.2 IR 最小定义
+---------------
+    LayerIR:
+      op_type:         "matmul" | "conv2d" | ...
+      shapes:          {M, N, K} 或 {N, H, W, C, K, R, S}
+      dtype:           fp16 / int8 / ...
+      accum_dtype:     fp32 / int32 / ...      # 累加器位宽
+      tile:            {tm, tn, tk}             # DSE 时由搜索器填
+      mapping:         {...}                    # MXU 维度绑定，可选
+      reduction_order: ReductionOrder | None    # 累加顺序，详见 4.6
+      schedule:        None                     # 中期接入 cycle-accurate 时填
+
+4.3 HardwareConfig 最小定义
+---------------------------
+    mxu_dim:      (128, 128)
+    sram_bytes:   16 MB
+    hbm_bw_gbps:  900
+    freq_hz:     1.0
+    microarch:    None    # cycle-accurate 时填
+
+4.4 单层阶段的三个 Analyzer
+---------------------------
+
+  (1) MemoryAnalyzer
+      - 计算 tile 后 SRAM 占用：A_tile + B_tile + C_tile
+      - 判断是否超容
+      - 计算 HBM 流量（被复用次数决定）
+      - 返回 MemoryResult{ sram_bytes, hbm_bytes, fits }
+
+  (2) PerfAnalyzer（Roofline 起步）
+      - compute_time = MACs / (MXU 算力 × 利用率)
+      - memory_time  = bytes / hbm_bw
+      - latency      = max(compute_time, memory_time)
+      - 利用率：根据 tile 对齐 MXU 程度估算
+        （例：tm=130, MXU=128 -> 浪费 (128/256)）
+      - 返回 PerfResult{ latency_ns, utilization, ... }
+
+  (3) NumericalAnalyzer（静态分析起步）
+      - 读取 IR.reduction_order，按指定语义模拟累加
+      - fp16 / bf16 累加 K 维过长 -> 精度风险 warning
+      - int8 量化范围检查、累加器溢出检查
+      - 与 fp64+Kahan 黄金参考对比，给出 max_error / mean_error
+      - 返回 NumericalResult，必须显式记录 reduction_order_used
+      - 详细数值一致性约束见 4.6 节
+
+4.5 Tile 显式化原则
+-------------------
+即使单层阶段，也由 IR 携带 tile，Analyzer 不自行推导。
+DSE 搜索器枚举 tile 组合，反复调 Analyzer：
+
+    for tile in enumerate_tiles(ir, hw):
+        ir.tile = tile
+        perf = PerfAnalyzer().run(ir, hw)
+        mem  = MemoryAnalyzer().run(ir, hw)
+        if mem.fits:
+            record(tile, perf, mem)
+
+职责清晰：搜索器负责选 tile，Analyzer 只负责评估给定 tile。
+
+4.6 数值统一性原则（量化场景下的累加顺序处理）
+----------------------------------------------
+
+4.6.1 问题背景
+量化（fp16 / bf16 / int8 等）场景下，累加顺序影响最终结果：
+  - (a+b)+c ≠ a+(b+c)  在有限精度下成立
+  - 线性累加、树形累加、脉动阵列累加，结果各不相同
+  - 同一硬件不同 tile 切分下，累加顺序也会变化
+
+若 Analyzer 不固定累加语义，会出现「同一 IR 跑两次结果不同」或
+「评估结果与实际硬件对不上」，违反纯函数与确定性契约。
+
+4.6.2 核心原则：累加顺序作为 IR 的显式属性
+不让 Analyzer 自行选择累加方式，也不让它推测硬件行为。
+累加顺序作为 IR 的一部分，由上游 mapping pass 显式指定。
+
+  上游（mapping pass）→ 决定累加顺序 → 写入 IR.reduction_order
+                                 ↓
+  下游（NumericalAnalyzer）→ 读 IR.reduction_order → 按指定语义计算
+
+NumericalAnalyzer 永远不知道自己在评估哪块硬件，只忠实执行 IR 的指令。
+硬件知识被隔离在 mapping 阶段，Analyzer 保持 hardware-agnostic。
+
+4.6.3 hardware-agnostic 的边界澄清
+区分两种情况：
+
+  应避免：Analyzer 内部 if hw.vendor == "tpu_v4": use_systolic_order()
+          —— 硬件细节硬编码进评估逻辑
+
+  应保留：评估结果反映硬件真实行为
+          —— 否则精度模型与实际部署对不上
+
+正确做法：让「硬件行为」作为 IR 的输入数据，而非 Analyzer 的判断分支。
+
+4.6.4 ReductionOrder 定义（起步版本）
+扁平枚举即可，后续按需扩展为嵌套结构：
+
+    class ReductionOrder(Enum):
+        SEQUENTIAL              # 线性累加 ((a+b)+c)+d
+        TREE                    # 树形累加 (a+b)+(c+d)
+        BLOCKED                 # 分块累加（块内顺序，块间树形）
+        SYSTOLIC                # 脉动阵列风格累加
+
+    # 带参数的可演进为 dataclass：
+    # BLOCKED(block_size=32)
+    # SYSTOLIC(shape=(128,128))
+
+4.6.5 累加顺序的三种来源
+  场景 A：DSE 探索阶段
+    - 搜索器枚举不同 mapping，每种 mapping 隐含一种 reduction_order
+    - Analyzer 评估每一种，正是 DSE 想看到的精度对比
+
+  场景 B：部署预估
+    - mapping 由编译器决定，编译器知道目标硬件
+    - 编译器在生成 IR 时填入对应的 reduction_order
+    - Analyzer 只读不判断
+
+  场景 C：算法侧验证
+    - 用户显式指定 ReductionOrder.TREE 等，了解理想精度上界
+
+三种场景下，Analyzer 代码完全相同 —— 显式化的根本好处。
+
+4.6.6 数值统一的具体保障措施
+
+  (1) 禁止 Analyzer 内部使用浮点不稳定操作
+      - 不用 np.sum（实现可能因 SIMD 不同而变）
+      - 用 math.fsum 或显式 axis 顺序的 np.add.reduce
+      - 若用 GPU/JAX 加速，禁用非确定性 kernel
+
+  (2) reduction_order 加入契约测试
+      class AnalyzerContractTest:
+          ...
+          def test_same_reduction_order_bit_exact(self):
+              # 同 IR 同 reduction_order 跑两次，必须 bit-exact
+          def test_different_reduction_order_differs(self):
+              # NumericalAnalyzer 对不同 reduction_order 应给出不同结果
+              # （否则说明它没读 IR.reduction_order）
+
+  (3) NumericalResult 显式记录使用的累加语义
+      @dataclass
+      class NumericalResult:
+          max_error:            float
+          mean_error:           float
+          reduction_order_used: ReductionOrder   # 必填
+          reference_order:      ReductionOrder   # 对比基准
+          accum_overflow:       bool
+          warnings:             list[str]
+
+      下游看到结果时，立刻能知道是在哪种累加假设下得到的。
+      若两次实验对不上，先查这两个字段。
+
+  (4) 统一的黄金参考
+      所有 reduction_order 都与 fp64 + Kahan summation 对比：
+        - 不同累加方式的 NumericalResult 之间相对于同一基准
+        - 跨实验、跨 tile、跨 mapping 的结果可比
+
+4.6.7 副作用：reduction_order 也影响性能
+  - 树形累加：延迟低，寄存器占用高
+  - 线性累加：延迟高，寄存器占用低
+  reduction_order 不是 NumericalAnalyzer 专属，而是 IR 的通用属性，
+  PerfAnalyzer / MemoryAnalyzer 也可读取。这进一步证明它属于 IR 而非
+  Analyzer 内部参数。
+
+
+================================================================================
+5. Cycle-Accurate 模型融合方案（中期目标）
+================================================================================
+
+5.1 是否融合
+------------
+融合。Roofline 与 cycle-accurate 对外契约一致：输入 (IR, HW)，输出性能结果。
+调用方不应感知底层实现差异，否则会出现 `if mode == ...` 的代码腐化。
+
+但「融合」≠「塞进同一个类」。融合发生在抽象基类与 Result 类层面，
+具体实现保持独立。
+
+5.2 融合点：PerfAnalyzer 抽象层
+-------------------------------
+    PerfAnalyzer (抽象)
+    ├── RooflinePerfAnalyzer       （单层阶段已实现）
+    ├── AnalyticalPerfAnalyzer     （更精细的解析模型）
+    └── CycleAccuratePerfAnalyzer  （中期接入，内部跑仿真）
+
+  - 所有性能 Analyzer 共享 analyze(ir, hw) -> PerfResult 接口
+  - 内部实现可任意复杂
+
+5.3 PerfResult 的前向兼容设计
+-----------------------------
+    @dataclass
+    class PerfResult:
+        # 所有 Perf Analyzer 必填
+        latency_ns:     float
+        throughput_ops: float
+        utilization:    float
+
+        # cycle-accurate 才填，其他留空
+        pipeline_bubbles: int | None = None
+        bank_conflicts:   int | None = None
+        cycle_trace:      list | None = None
+
+        # 元数据
+        model_name:  str   # "roofline" / "cycle_accurate"
+        confidence:  str   # "approximate" / "accurate"
+
+  - 基础字段保证调用方代码不变
+  - 详细字段按需读取
+  - 切换 Roofline ↔ Cycle-accurate 仅替换 Analyzer，外部无感
+
+5.4 CycleAccuratePerfAnalyzer 内部结构
+--------------------------------------
+内部可任意分层，但不外泄：
+
+    CycleAccuratePerfAnalyzer
+      ├── Simulator (MXU 流水线、SRAM、DMA 模型)
+      ├── EventQueue
+      └── 对外仅暴露 analyze(ir, hw) -> PerfResult
+
+外部视角与 Roofline 无差别，体现「接口稳定，实现自由」。
+
+5.5 IR 与 HardwareConfig 的扩展（向前兼容）
+-------------------------------------------
+不分裂数据类，使用可选字段扩展：
+
+  IR 扩展：
+    schedule: ScheduleInfo | None = None
+      - Roofline 不读
+      - Cycle-accurate 在 validate_input 中检查存在
+      - 单层阶段先占位，不实现
+
+  HardwareConfig 扩展：
+    microarch: MicroarchConfig | None = None
+      - 含流水线深度、SRAM bank 数、DMA 通道数等
+      - Roofline 不读
+      - Cycle-accurate 必读
+
+5.6 融合带来的额外收益：交叉验证
+---------------------------------
+同一 (IR, HW) 跑两个模型，对比结果：
+  - Roofline 应为 Cycle-accurate 的乐观上界
+  - 若 Roofline 比 Cycle-accurate 还慢，说明建模有 bug
+  - 实现仅需在 Pipeline 中并列两个 Analyzer，无需额外代码
+
+    pipeline = AnalysisPipeline([
+        RooflinePerfAnalyzer(),
+        CycleAccuratePerfAnalyzer(),
+        MemoryAnalyzer(),
+    ])
+    results = pipeline.run(ir, hw)
+    # 对比 results["roofline"].latency_ns vs
+    #     results["cycle_accurate"].latency_ns
+
+
+================================================================================
+6. 数据流与 Pass 体系（从 AI 模型到 IR）
+================================================================================
+
+6.1 完整数据流
+--------------
+评估系统的输入是 AI 模型，输出是评估结果。中间经过若干 Pass 渐进
+填充 IR 的各个属性，最后由 Analyzer 评估：
+
+    AI Model (PyTorch / .pth + 模型类定义)
+           │
+           ▼  [1] Frontend Parser
+    Graph IR（高层算子图：Conv / Pool / MatMul / ...）
+           │
+           ▼  [2] Graph-level Optimization
+    Optimized Graph IR（融合、常量折叠、layout 转换）
+           │
+           ▼  [3] Lowering / Decomposition
+    Layer IR（单层规范化：MatMul / Conv2D + shape / dtype）
+           │
+           ▼  [4] Quantization (可选)
+    Quantized Layer IR（含 dtype + accum_dtype）
+           │
+           ▼  [5] Tiling Pass
+    Tiled Layer IR（含 tile）
+           │
+           ▼  [6] Mapping Pass
+    Mapped Layer IR（含 mapping + reduction_order）
+           │
+           ▼  [7] Scheduling Pass（中期，cycle-accurate 时启用）
+    Scheduled Layer IR（含 schedule）
+           │
+           ▼
+    Analyzer Pipeline → Results
+
+每一步是一个 pass，输入输出都是 IR 的不同「完整度」。
+
+6.2 关键澄清：不是「两层 IR」，是「同一 IR 的渐进填充」
+--------------------------------------------------------
+Graph IR 与 Layer IR 共用同一个 OpIR 定义：
+  - Graph IR：节点是 op，边是 tensor，每个节点内部是一个 OpIR
+  - Layer IR：图中单个节点的 OpIR
+
+Graph 只是 OpIR 的容器。这样单层评估和多层评估能共享同一套
+Analyzer 接口。IR 的字段（tile / mapping / reduction_order /
+schedule）随着 Pass 推进逐步从 None 填充为具体值。
+
+6.3 Pass 与 Analyzer 的职责边界
+-------------------------------
+两类完全不同的组件，不能混淆：
+
+  Pass     ：变换 IR，签名 IR → IR'
+  Analyzer ：评估 IR，签名 IR → Result
+
+  Pass 之间有顺序依赖（必须 tiling 后再 mapping）
+  Analyzer 之间无依赖（可并行）
+
+  Pass 包含硬件相关决策（如何切、怎么映射）
+  Analyzer 不做决策，只忠实评估给定 IR
+
+文档前面章节已详细定义 Analyzer 体系；本节起补充 Pass 体系。
+
+6.4 各 Pass 的职责
+------------------
+
+[1] Frontend Parser
+  - 把外部模型格式解析为内部 Graph IR
+  - 适配层：每种输入框架一个 parser，输出统一
+  - PyTorch 路径见 6.5
+
+[2] Graph-level Optimization
+  - 算子融合（Conv+BN+ReLU、MatMul+Add）
+  - 常量折叠、死节点消除
+  - Layout 转换（NCHW ↔ NHWC）
+  - 这些是结构性优化，不涉及硬件细节
+
+[3] Lowering / Decomposition
+  - 把高层算子拆解或规范化
+  - 例：LayerNorm → mean / var / normalize
+  - 例：Conv2D → im2col + MatMul（在某些路径下）
+  - 决定「评估的最小粒度」
+
+[4] Quantization Pass
+  - 决定每层 dtype、accum_dtype、scale / zero_point
+  - 量化决策本身不属于 Analyzer，是上游 pass
+  - Analyzer 只评估量化后的结果
+
+[5] Tiling Pass
+  - 根据 SRAM 容量和数据复用模式切分
+  - DSE 阶段：搜索器枚举 tile 组合
+  - 部署阶段：固定策略
+  - 输出：填充 IR.tile
+
+[6] Mapping Pass
+  - 把 tile 后的循环维度绑定到 MXU 具体轴
+  - 隐含累加顺序：决定哪个维度走 MXU 内部累加、哪个维度走外部累加
+  - 输出：填充 IR.mapping 与 IR.reduction_order
+  - 这是「硬件行为以数据形式入 IR」的具体落点
+
+[7] Scheduling Pass
+  - 指令级排布、DMA 与计算的重叠安排
+  - Roofline 阶段不需要
+  - Cycle-accurate 阶段必需
+  - 输出：填充 IR.schedule
+
+6.5 PyTorch 输入路径
+--------------------
+
+输入要求（明确约定）
+  .pth 文件本身只是 state_dict（参数名 → tensor），不含计算图结构。
+  Frontend Parser 必须接收两个输入：
+    (a) 模型类定义（Python 代码）
+    (b) .pth 权重文件
+  缺一不可。
+
+三种解析路径
+
+  路径 A：torch.fx（推荐起步）
+    model.load_state_dict(torch.load("xxx.pth"))
+    graph = torch.fx.symbolic_trace(model)
+    # 遍历 graph.nodes，转成 Graph IR
+    优点：纯 Python、无需运行时输入、op 语义清晰
+    缺点：动态控制流支持有限（TPU 部署多为静态图，不是问题）
+
+  路径 B：torch.export（PyTorch 2.x）
+    比 fx 更稳定，dynamic shape 支持更好
+    若使用 PyTorch 2.x，优先选此路径
+
+  路径 C：经 ONNX 中转
+    .pth → ONNX → Graph IR
+    优点：未来支持 TF / JAX 时可共享 Frontend
+    缺点：多一层格式转换，语义损失与调试成本增加
+
+设计选择
+  起步用 torch.fx 或 torch.export 直接对接。
+  以后真要支持多框架时，再加 ONNX 路径作为可选项。
+
+6.6 DSE 在数据流中的位置
+------------------------
+DSE 不是独立模块，而是外层循环，反复调用 [5][6] 两个 Pass + Analyzer：
+
+    ir_base = run_passes_1_to_4(model)   # 固定上游
+    for tiling_choice in tiling_search_space:
+        ir_tiled = TilingPass(ir_base, tiling_choice)
+        for mapping_choice in mapping_search_space:
+            ir_mapped = MappingPass(ir_tiled, mapping_choice)
+            results = AnalyzerPipeline.run(ir_mapped, hw)
+            record(tiling_choice, mapping_choice, results)
+    best = pick_pareto_optimal(records)
+
+Tiling 与 mapping 是搜索变量，[1]-[4] 一次跑完后复用。
+若也要搜量化策略，则把 [4] 也纳入循环。
+
+6.7 部署预估在数据流中的位置
+----------------------------
+部署预估不搜索，[1]-[7] 顺序跑一遍：
+
+    ir = Frontend(model_cls, pth_file)
+    ir = GraphOpt(ir)
+    ir = Lowering(ir)
+    ir = Quantize(ir, qconfig)
+    ir = Tiling(ir, tile_strategy)        # 编译器策略
+    ir = Mapping(ir, target_hw)           # 编译器策略
+    ir = Scheduling(ir, target_hw)        # cycle-accurate 时
+    results = AnalyzerPipeline.run(ir, target_hw)
+
+同样的 Analyzer，不同的上游 Pass 配置。
+
+6.8 Pass 接口约定（与 Analyzer 一致）
+-------------------------------------
+为保持架构一致性，Pass 也用抽象基类 + 模板方法：
+
+    class Pass(ABC):
+        name: str
+
+        @abstractmethod
+        def transform(self, ir: OpIR, **kwargs) -> OpIR:
+            ...
+
+        def validate_input(self, ir, **kwargs) -> None:
+            ...
+
+        def run(self, ir, **kwargs) -> OpIR:
+            self.validate_input(ir, **kwargs)
+            new_ir = self.transform(ir, **kwargs)
+            self._postcheck(new_ir)
+            return new_ir
+
+Pass 也应是纯函数（不修改输入 IR，返回新 IR），便于 DSE 的反复调用。
+契约测试：test_does_not_mutate_input / test_deterministic 等。
+
+
+================================================================================
+7. 演进路线
+================================================================================
+
+阶段 0：手工 IR 验证 Analyzer 体系（最先做）
+  □ 跳过所有 Frontend / Pass，手写几个典型 Layer IR
+       例：MatMul (M=1024, N=1024, K=1024, fp16)
+           Conv2D (ResNet block 中的某层)
+  □ 手填 tile / mapping / reduction_order
+  □ 跑通 RooflinePerfAnalyzer / MemoryAnalyzer / NumericalAnalyzer
+  □ 验证 AnalyzerPipeline 与 ContractTest 框架
+  □ 目的：在前端复杂度阻塞前，先证明评估架构本身是对的
+
+阶段一：单层 + Roofline + 最小 Pass 集
+  □ 定义 OpIR 基类与 MatMulIR / Conv2DIR
+  □ 定义 HardwareConfig（基础字段）
+  □ 定义 ReductionOrder 枚举（SEQUENTIAL / TREE / BLOCKED / SYSTOLIC）
+  □ 实现 Analyzer 抽象基类（含模板方法 run()）
+  □ 实现 RooflinePerfAnalyzer / MemoryAnalyzer / StaticNumericalAnalyzer
+  □ NumericalAnalyzer 必须读取 IR.reduction_order 并按其语义计算
+  □ 实现 PerfResult / MemoryResult / NumericalResult
+       （NumericalResult 含 reduction_order_used / reference_order）
+  □ 实现 AnalysisPipeline
+  □ 编写 AnalyzerContractTest 套件
+       （含 test_same_reduction_order_bit_exact /
+            test_different_reduction_order_differs）
+  □ 建立 fp64 + Kahan 黄金参考路径
+  □ 实现 Pass 抽象基类与最小 TilingPass / MappingPass
+       （即使简单策略也要走 Pass 接口，搭好骨架）
+  □ IR 中预留 schedule 字段（None）
+  □ HardwareConfig 中预留 microarch 字段（None）
+  □ PerfResult 中预留 cycle 相关字段（None）
+
+阶段二：PyTorch Frontend 与 Graph 优化
+  □ 实现 PyTorch Frontend（torch.fx 路径优先）
+       接收 (模型类, .pth 文件) 输出 Graph IR
+  □ 实现基础 GraphOpt Pass（融合、layout） - reserved
+  □ 实现 Lowering Pass（高层算子 → MatMul/Conv2D）
+  □ Analyzer Pipeline 支持图遍历，签名不变
+  □ 增加跨层数据复用分析（生产-消费链上的片上驻留）- reserved
+
+阶段三：量化 Pass 与 DSE 搜索器
+  □ 实现 QuantizationPass（dtype + accum_dtype 决策）
+  □ 实现 DSE 搜索器框架（穷举起步，可演进为启发式）- reserved
+  □ Tiling 搜索空间枚举 - reserved
+  □ Mapping 搜索空间枚举（与 reduction_order 联动）- reserved
+
+阶段四：接入 Cycle-Accurate
+  □ 实现 SchedulingPass（指令序列 / DMA 调度）
+  □ 实现 MicroarchConfig
+  □ 实现 CycleAccuratePerfAnalyzer（内部 Simulator）
+  □ 启用 Roofline 与 Cycle-accurate 交叉验证
+  □ 复用已有 Pipeline 与 ContractTest
+
+阶段五：多核 / 片间互联（按需）
+  □ HardwareConfig 演进为含 List[CoreConfig]
+  □ IR 引入 device / stream 概念
+  □ 新增 InterconnectAnalyzer
+
+
+================================================================================
+8. 关键设计原则总结
+================================================================================
+
+  1. IR 只承载数据，不承载评估方法。
+  2. 评估能力按关注点拆分，每个 Analyzer 独立、纯函数、可组合。
+  3. 接口契约由抽象基类 + 模板方法强制，由契约测试守护。
+  4. 向前兼容靠「可选字段」而非「类分裂」。
+  5. 抽象层稳定，实现层自由演进。
+  6. Tile / mapping / schedule / reduction_order 显式化，
+     搜索器与 Analyzer 职责分离。
+  7. Analyzer 间禁止直接依赖，共享数据下沉到 IR attribute。
+  8. Hardware-agnostic 不等于忽略硬件行为：硬件行为以数据形式
+     进入 IR（reduction_order / mapping / schedule），不以分支
+     形式进入 Analyzer。
+  9. 数值结果必须可重复、可比较：累加顺序显式、参考基准统一、
+     使用确定性数值实现、Result 显式记录使用的语义。
+ 10. Pass 与 Analyzer 是两类不同组件：Pass 变换 IR 含硬件决策，
+     Analyzer 评估 IR 不做决策。两者均为纯函数，均走相同的抽象基类
+     + 模板方法 + 契约测试模式。
+ 11. 验证顺序：手工 IR → Analyzer 体系 → 加 Pass → 加 Frontend。
+     不让前端复杂度阻塞核心评估架构的验证。
+
+
+================================================================================
+9. 待决策事项（后续讨论）
+================================================================================
+
+  - 单层起步选 MatMul 还是 Conv2D（Conv 多 R/S 维度与 im2col 选择）
+    Ans:保留 Conv2D 为一等算子。Conv2D 的内存访问模式和 MatMul 差异很大——stride/padding 影响 HBM 流量计算，数据复用模式也不同。如果降为 MatMul，MemoryAnalyzer 会丢失这些信息，分析结果会不准。
+  - OpIR 字段的最终 Python/C++ 实现
+  - tile 枚举策略（穷举 / 启发式 / 基于约束的剪枝）
+  - mapping 的描述语法（自定义 DSL / 借鉴 TVM Schedule）
+  - ScheduleInfo 的粒度（指令级 / 块级）
+  - ReductionOrder 的初始粒度（扁平枚举起步，是否支持嵌套结构如
+    BLOCKED 块内 SEQUENTIAL + 块间 TREE）
+  - NumericalAnalyzer 的实现方式：纯解析公式估计，还是小规模
+    随机采样模拟 + 误差统计
+  - PyTorch Frontend 路径选择：torch.fx vs torch.export
+    （取决于使用的 PyTorch 版本与 dynamic shape 需求）
+  - 是否在阶段二即引入 ONNX 作为可选 Frontend 路径
+  - Lowering 粒度：是否将 Conv2D 在 IR 层降为 im2col + MatMul，
+    还是保留 Conv2D 作为一等算子由 Analyzer 自行处理
+
+================================================================================
+                              文档结束
+================================================================================
