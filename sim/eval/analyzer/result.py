@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from ir import ReductionOrder
+from frontend.ir import ReductionOrder
 from typing import Optional
 
 @dataclass(frozen=True)

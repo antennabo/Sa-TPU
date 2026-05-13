@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
-from ir import OpIR, MatMulIR, Conv2dIR, ElementwiseIR, ReductionOrder
-from hw import HardwareConfig
-from result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
-from numpy_ops import quantize_weight, np_linear, conv2d, np_relu, maxpool
+from frontend.ir import OpIR, MatMulIR, Conv2dIR, ElementwiseIR, ReductionOrder
+from backend.hw import HardwareConfig
+from .result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
+from utils.utils import quantize_weight, np_linear, conv2d, np_relu, maxpool
 import numpy as np
 
 class Analyzer(ABC):
@@ -239,10 +239,10 @@ class NumericalAnalyzer(Analyzer):
             warnings=(),
         )
 
-    def analyze_graph(self, irs, sample_input) -> NumericalResult:
-
-        out_fp32 = self._forward(irs, sample_input, quantize=False)
-        out_q    = self._forward(irs, sample_input, quantize=True)
+    def analyze_graph(self, irs, sample_input, exported) -> NumericalResult:
+        weights  = self._extract_weights(exported)
+        out_fp32 = self._forward(irs, sample_input, weights, quantize=False)
+        out_q    = self._forward(irs, sample_input, weights, quantize=True)
         error = np.abs(out_fp32 - out_q)
         return NumericalResult(
             max_error=float(error.max()),
@@ -254,12 +254,36 @@ class NumericalAnalyzer(Analyzer):
         )
 
     @staticmethod
-    def _forward(irs, sample_input, quantize: bool):
+    def _extract_weights(exported) -> list:
+        """按图顺序提取每个 Conv2d/Linear 的 (W, b)"""
+        param_map = {
+            spec.arg.name: spec.target
+            for spec in exported.graph_signature.input_specs
+            if spec.kind.name == "PARAMETER"
+        }
+        state_dict = exported.state_dict
+        weights = []
+        for node in exported.graph.nodes:
+            if node.op != "call_function":
+                continue
+            name = node.target.__name__ if hasattr(node.target, "__name__") else str(node.target)
+            if "conv2d" in name or "linear" in name:
+                W_node = node.args[1]
+                b_node = node.args[2] if len(node.args) > 2 else None
+                W = state_dict[param_map[W_node.target]].detach().numpy()
+                b = state_dict[param_map[b_node.target]].detach().numpy() if b_node else None
+                weights.append((W, b))
+        return weights
+
+    @staticmethod
+    def _forward(irs, sample_input, weights, quantize: bool):
         x = sample_input.astype(np.float32)
+        wi = 0
         for ir in irs:
             if isinstance(ir, (Conv2dIR, MatMulIR)):
-                W = ir.input_weight.astype(np.float32)
-                b = ir.bias.astype(np.float32) if ir.bias is not None else 0
+                W, b = weights[wi]; wi += 1
+                W = W.astype(np.float32)
+                b = b.astype(np.float32) if b is not None else 0
                 if quantize:
                     W = quantize_weight(W, ir.dtype)
                 x = conv2d(x, W, b) if isinstance(ir, Conv2dIR) else np_linear(x, W, b)

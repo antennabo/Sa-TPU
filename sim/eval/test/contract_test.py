@@ -1,8 +1,8 @@
 import pytest
-from ir import MatMulIR, ReductionOrder
-from hw import HardwareConfig
-from result import AnalysisResult, NumericalResult
-from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, NumericalAnalyzer
+from sim.eval.frontend.ir import MatMulIR, ReductionOrder
+from sim.eval.backend.hw import HardwareConfig
+from sim.eval.analyzer.result import AnalysisResult, NumericalResult
+from sim.eval.analyzer.analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, NumericalAnalyzer
 
 def make_op(reduction_order=ReductionOrder.SEQUENTIAL):
     return MatMulIR(op_type="matmul", dtype="fp16", accum_dtype="fp32",
@@ -62,7 +62,7 @@ class TestNumericalContract:
 
     def make_irs(self, dtype="int8"):
         import numpy as np
-        from ir import MatMulIR
+        from sim.eval.frontend.ir import MatMulIR
         W = np.random.randn(64, 64).astype(np.float32)
         b = np.random.randn(64).astype(np.float32)
         return [MatMulIR(op_type="linear", dtype=dtype, accum_dtype="fp32",

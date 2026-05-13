@@ -1,5 +1,5 @@
-from ir import OpIR, Conv2dIR, MatMulIR, ElementwiseIR
-from transform import Transform
+from frontend.ir import OpIR, Conv2dIR, MatMulIR, ElementwiseIR
+from backend.transform import Transform
 
 class LoweringTransform(Transform):
     name = "lowering"

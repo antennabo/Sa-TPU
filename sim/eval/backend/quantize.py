@@ -1,6 +1,6 @@
 import dataclasses
-from transform import Transform
-from ir import OpIR, Conv2dIR, MatMulIR, ElementwiseIR
+from backend.transform import Transform
+from frontend.ir import OpIR, Conv2dIR, MatMulIR, ElementwiseIR
 
 class QuantizationTransform(Transform):
     name = "quantization"

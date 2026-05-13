@@ -25,10 +25,6 @@ class MatMulIR(OpIR):
     reduction_order: Optional[ReductionOrder] = None
     mapping:         Optional[dict] = None   # MXU 维度绑定
     schedule:        None           = None   # cycle-accurate 预留
-    
-    input_data: Optional[object] = None   # numpy array，NumericalAnalyzer 用
-    input_weight: Optional[object] = None  # numpy array [N, K]
-    bias:         Optional[object] = None  # numpy array [N]
 
 @dataclass(frozen=True)
 class Conv2dIR(OpIR):
@@ -49,20 +45,12 @@ class Conv2dIR(OpIR):
     mapping:         Optional[dict]           = None
     schedule:        None                     = None
 
-    input_data: Optional[object] = None   # numpy array，NumericalAnalyzer 用
-    input_weight: Optional[object] = None  # numpy array [N, K]
-    bias:         Optional[object] = None  # numpy array [N]
-
 @dataclass(frozen=True)
 class ElementwiseIR(OpIR):
     op:     str          # "relu" / "maxpool" / "flatten"
     shape:  tuple        # 输入 shape，例如 (1, 8, 28, 28)
 
-# TODO: GraphOpt - FusedConvReluIR（Conv+ReLU 融合，减少 SRAM 读写）
-# TBD:
-# 没有融合时，Conv 和 ReLU 是两个独立步骤：
-# Conv 计算 → 结果写回 SRAM → ReLU 从 SRAM 读出 → 结果再写回 SRAM
-# 中间有一次多余的「写回 + 读出」，浪费内存带宽。
-# 融合后：
-# Conv 计算 → 结果还在寄存器里 → 直接做 ReLU → 写回 SRAM
-# 结果不落地，直接在寄存器里过一遍 ReLU，节省了一次 SRAM 读写。
+# TODO: FusedConvReluIR
+@dataclass(frozen=True)
+class FusedConvReluIR(Conv2dIR):
+    pass

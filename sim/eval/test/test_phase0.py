@@ -1,11 +1,11 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from ir import MatMulIR, ReductionOrder
-from hw import HardwareConfig
+from sim.eval.frontend.ir import MatMulIR, ReductionOrder
+from sim.eval.backend.hw import HardwareConfig
 # from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline, StaticNumericalAnalyzer
-from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline, NumericalAnalyzer
-from result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
+from sim.eval.analyzer.analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline, NumericalAnalyzer
+from sim.eval.analyzer.result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
 
 import sys, numpy as np, torch
 sys.path.insert(0, "../model")

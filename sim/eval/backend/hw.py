@@ -7,4 +7,6 @@ class HardwareConfig:
     sram_bytes:   int              # 16 * 1024 * 1024
     hbm_bw_gbps:  float           # 900.0
     freq_mhz:     float           # 1.0
+    dtype:        str = "int8"             # 计算精度
+    accum_dtype:  str = "int32"            # 累加精度
     microarch:    Optional[object] = None  # 中期 cycle-accurate 时填

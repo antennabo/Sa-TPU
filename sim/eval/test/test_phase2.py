@@ -4,11 +4,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../model"))
 
 import torch
 from SimpleCNN import SimpleCNN
-from frontend import export_to_ir
-from hw import HardwareConfig
-from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline
-from ir import MatMulIR, ReductionOrder
-from transform import TilingTransform, MappingTransform
+from sim.eval.frontend.modelparser import export_to_ir
+from sim.eval.backend.hw import HardwareConfig
+from sim.eval.analyzer.analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline
+from sim.eval.frontend.ir import MatMulIR, ReductionOrder
+from sim.eval.frontend.transform import TilingTransform, MappingTransform
 
 # 1. 加载模型
 model = SimpleCNN()
@@ -53,12 +53,12 @@ for ir in irs:
 # for layer, r in results.items():
 #     print(f"{layer}: {r}")
 
-from lowering import lower_graph
+from sim.eval.backend.lowering import lower_graph
 lowered = lower_graph(irs)
 print("Lowered IR 数量:", len(lowered))
 # print("Lowered IR 数量:", lowered)
 
-from quantize import quantize_graph
+from sim.eval.backend.quantize import quantize_graph
 
 quantized_irs = quantize_graph(irs)
 for ir in quantized_irs:

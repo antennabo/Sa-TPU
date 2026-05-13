@@ -8,10 +8,10 @@ import torch
 import numpy as np
 from torchvision import datasets, transforms
 from SimpleCNN import SimpleCNN
-from frontend import export_to_ir
-from quantize import quantize_graph
-from hw import HardwareConfig
-from analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, NumericalAnalyzer, AnalysisPipeline
+from sim.eval.frontend.modelparser import export_to_ir
+from sim.eval.backend.quantize import quantize_graph
+from sim.eval.backend.hw import HardwareConfig
+from sim.eval.analyzer.analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, NumericalAnalyzer, AnalysisPipeline
 
 # 1. 加载模型
 model = SimpleCNN()
@@ -36,7 +36,7 @@ hw = HardwareConfig(mxu_dim=(8,8), sram_bytes=16*1024*1024,
                     hbm_bw_gbps=900.0, freq_mhz=1000.0)
 
 # 6. Perf + Memory Pipeline
-from transform import fill_activations
+from sim.eval.frontend.transform import fill_activations
 filled_irs = fill_activations(quantized_irs, x_np)   # 填 input_data
 pipeline = AnalysisPipeline([RooflinePerfAnalyzer(), MemoryAnalyzer(), NumericalAnalyzer()])
 
