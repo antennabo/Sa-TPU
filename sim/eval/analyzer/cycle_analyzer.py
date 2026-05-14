@@ -79,37 +79,44 @@ class CycleAccurateAnalyzer(Analyzer):
         OS: row i 前插 i 个 0，col j 前插 j 个 0
         """
         M, N = self.hw.mxu_dim
-        tail = M + N - 2  # 尾部补零量（最大 i/j=0 时）
+        # tail = M + N - 2  # 尾部补零量（最大 i/j=0 时）
+        tail = M #+ N - 2  # 尾部补零量（最大 i/j=0 时）
 
         if mode in ("WS", "OS"):
-            for i, fifo in enumerate(self.row_fifos):
+            for i, fifo in enumerate(self.col_fifos):
                 fifo.load([0] * i + list(A_tile[i, :]) + [0] * (tail - i))
 
         if mode in ("IS", "OS"):
-            for j, fifo in enumerate(self.col_fifos):
+            for j, fifo in enumerate(self.row_fifos):
                 fifo.load([0] * j + list(B_tile[:, j]) + [0] * (tail - j))
 
     def control(self):
         M, N = self.hw.mxu_dim
+        mode  = self.sa.mode
         self.sa.control()
 
-        for j in range(N):
-            val = self.col_fifos[j].pop()
-            if val is not None:
-                self.sa.pes[0][j].load_a(val)
-                self.sa._row_countdown = 2
-                self.sa.done = False
+        if mode in ("OS", "WS"):
+            col_data = [self.col_fifos[j].pop() for j in range(N)]
+            if any(v is not None for v in col_data):
+                self.sa.load_row(0, [v if v is not None else 0 for v in col_data])
 
-        for i in range(M):
-            val = self.row_fifos[i].pop()
-            if val is not None:
-                self.sa.pes[i][0].load_b(val)
-                self.sa._col_countdown = 2
-                self.sa.done = False
+        if mode in ("OS", "IS"):
+            row_data = [self.row_fifos[i].pop() for i in range(M)]
+            if any(v is not None for v in row_data):
+                self.sa.load_col(0, [v if v is not None else 0 for v in row_data])
 
     def simulate(self, A_tile: np.ndarray, B_tile: np.ndarray, mode: str = "OS"):
+        M, N = self.hw.mxu_dim
         self.sa.reset()
         self.init_fifos(A_tile, B_tile, mode)
+
+        # broadcast stationary data directly from tile
+        if mode == "WS":
+            for j in range(N):
+                self.sa.load_col(j, B_tile[:, j])
+        elif mode == "IS":
+            for i in range(M):
+                self.sa.load_row(i, A_tile[i, :])
 
         # while any(not f.empty() for f in self.row_fifos + self.col_fifos) or not self.sa.done:
         while not self.sa.done:

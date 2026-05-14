@@ -9,9 +9,9 @@ class spatial_array(module):
         self.N = N
         self.mode = mode
         self.pes = [[pe(dtype_in=dtype_in, dtype_acc=dtype_acc) for _ in range(N)] for _ in range(M)]
-        self._row_countdown = 0
-        self._col_countdown = 0
-        self.done = True
+        self._row_countdown = 2
+        self._col_countdown = 2
+        self.done = False
 
     def load_row(self, i, data):
         """Load activations into row i: data[j] → pe[i][j].a"""
@@ -35,8 +35,8 @@ class spatial_array(module):
         for i in range(self.M):
             for j in range(self.N):
                 self.pes[i][j].reset()
-        self._row_countdown = 0
-        self._col_countdown = 0
+        self._row_countdown = 2
+        self._col_countdown = 2
         self.done = False
 
     def control(self):
@@ -47,24 +47,66 @@ class spatial_array(module):
             b   = [int(self.pes[i][j].b)   for j in range(self.N)]
             acc = [int(self.pes[i][j].acc) for j in range(self.N)]
             print(f"    row{i}  a={a}  b={b}  acc={acc}")
-        if self.mode in ("WS", "OS"):
+        # if self.mode in ("WS", "OS"):
+        #     # a enters row 0, shifts top→bottom
+        #     a_snap = [[self.pes[i][j].a for j in range(self.N)] for i in range(self.M)]
+        #     for i in range(1, self.M):
+        #         for j in range(self.N):
+        #             self.pes[i][j].load_a(a_snap[i - 1][j])
+
+        # if self.mode in ("IS", "OS"):
+        #     # b enters col 0, shifts left→right
+        #     b_snap = [[self.pes[i][j].b for j in range(self.N)] for i in range(self.M)]
+        #     for i in range(self.M):
+        #         for j in range(1, self.N):
+        #             self.pes[i][j].load_b(b_snap[i][j - 1])
+
+        if self.mode == "OS":
             # a enters row 0, shifts top→bottom
             a_snap = [[self.pes[i][j].a for j in range(self.N)] for i in range(self.M)]
             for i in range(1, self.M):
                 for j in range(self.N):
                     self.pes[i][j].load_a(a_snap[i - 1][j])
 
-        if self.mode in ("IS", "OS"):
             # b enters col 0, shifts left→right
             b_snap = [[self.pes[i][j].b for j in range(self.N)] for i in range(self.M)]
             for i in range(self.M):
                 for j in range(1, self.N):
                     self.pes[i][j].load_b(b_snap[i][j - 1])
 
-        if self.mode == "OS":
             for i in range(self.M):
                 for j in range(self.N):
                     self.pes[i][j].acc = self.pes[i][j].state
+
+        if self.mode == "WS":
+            # a enters row 0, shifts top→bottom
+            a_snap = [[self.pes[i][j].a for j in range(self.N)] for i in range(self.M)]
+            for i in range(1, self.M):
+                for j in range(self.N):
+                    self.pes[i][j].load_a(a_snap[i - 1][j])
+
+            # partial sum flows top→bottom: pe[i][j].state → pe[i+1][j].acc
+            state_snap = [[self.pes[i][j].state for j in range(self.N)] for i in range(self.M)]
+            for j in range(self.N):
+                self.pes[0][j].acc = self.pes[0][j].dtype_state(0)
+            for i in range(1, self.M):
+                for j in range(self.N):
+                    self.pes[i][j].acc = state_snap[i - 1][j]
+
+        if self.mode == "IS":
+            # b enters col 0, shifts left→right
+            b_snap = [[self.pes[i][j].b for j in range(self.N)] for i in range(self.M)]
+            for i in range(self.M):
+                for j in range(1, self.N):
+                    self.pes[i][j].load_b(b_snap[i][j - 1])
+            
+            # partial sum flows left→right: pe[i][j].state → pe[i][j+1].acc
+            state_snap = [[self.pes[i][j].state for j in range(self.N)] for i in range(self.M)]
+            for i in range(self.M):
+                self.pes[i][0].acc = self.pes[i][0].dtype_state(0)
+            for i in range(self.M):
+                for j in range(1, self.N):
+                    self.pes[i][j].acc = state_snap[i][j - 1]
 
     def compute(self):
         for i in range(self.M):
