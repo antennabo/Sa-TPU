@@ -57,8 +57,26 @@ output = np.load("./tiles/layer3_output.npy")
 #     out_torch = model(x_torch).numpy().flatten()
 # print(f"[PyTorch]   {out_torch}")
 
-sim = Simulator(full_irs, x_np, hw)
+# sim = Simulator(full_irs, x_np, hw)
 # sim.run_static()
 # sim.run_numerical(exported)
-sim.cycle.analyze_from_tiles("./tiles", hw, layer="layer3")
+# sim.cycle.analyze_from_tiles("./tiles", hw, layer="layer3")
 # sim.run_cycle(exported)
+
+# --- debug: 小矩阵验证 ---
+from analyzer.cycle_analyzer import CycleAccurateAnalyzer
+from analyzer.sim_model.spatial_array import spatial_array
+from analyzer.sim_model.fifo import FIFO
+
+M, N, K = 8, 8, 8
+A = np.ones((M, K), dtype=np.int8)
+B = np.ones((K, N), dtype=np.int8)
+expected = A.astype(np.int32) @ B.astype(np.int32)
+print("Expected (numpy):\n", expected)
+
+ca = CycleAccurateAnalyzer()
+ca.hw = hw
+ca.sa = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32, mode="OS")
+ca.row_fifos = [FIFO() for _ in range(M)]
+ca.col_fifos = [FIFO() for _ in range(N)]
+ca.simulate(A, B, mode="OS")
