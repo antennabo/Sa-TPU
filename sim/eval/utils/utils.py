@@ -58,7 +58,7 @@ def conv2d(x, W, b, padding=1):
             for i in range(H_out):
                 for j in range(W_out):
                     patch = x_pd[n,:,i:i+kH,j:j+kW]
-                    out[n,c,i,j] = np.sum(patch * W[c]) + b[c]
+                    out[n,c,i,j] = np.sum(patch * W[c]) + (b[c] if b is not None and not np.isscalar(b) else 0)
     return out
 
 def maxpool(x, kernel=2):

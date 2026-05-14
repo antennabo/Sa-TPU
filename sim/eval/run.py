@@ -10,6 +10,7 @@ from frontend.frontend import Frontend
 from backend.backend import Backend
 from backend.hw import HardwareConfig
 from analyzer.simulator import Simulator
+import numpy as np
 
 # 1. 加载模型
 model = SimpleCNN()
@@ -37,11 +38,27 @@ frontend.print_irs()
 
 # 6. Backend: IR → quantize → tile → map → compile
 backend = Backend(hw)
-full_irs = backend.run(irs)
+full_irs, data = backend.run(irs, exported, x_np)
 backend.print_irs()
 
-# 7. 分析
+
+A_tiles = np.load("./tiles/layer3_A_tiles.npy")
+B_tiles = np.load("./tiles/layer3_B_tiles.npy")
+output = np.load("./tiles/layer3_output.npy")
+# print(A_tiles.shape)
+# print(B_tiles.shape)
+# print(output.shape)
+# print(A_tiles[0][0])
+# print(B_tiles[0][0])
+# # 7. 分析
+# # PyTorch 参考输出
+# x_torch = torch.from_numpy(x_np)
+# with torch.no_grad():
+#     out_torch = model(x_torch).numpy().flatten()
+# print(f"[PyTorch]   {out_torch}")
+
 sim = Simulator(full_irs, x_np, hw)
-sim.run_static()
-sim.run_numerical(exported)
-sim.run_cycle(exported)
+# sim.run_static()
+# sim.run_numerical(exported)
+sim.cycle.analyze_from_tiles("./tiles", hw, layer="layer3")
+# sim.run_cycle(exported)

@@ -2,11 +2,12 @@ from abc import ABC, abstractmethod
 from frontend.ir import OpIR, MatMulIR, Conv2dIR, ElementwiseIR, ReductionOrder
 from backend.hw import HardwareConfig
 from .result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
-from utils.utils import quantize_weight, np_linear, conv2d, np_relu, maxpool
+from utils.utils import quantize_weight, quantize_int8, np_linear, conv2d, np_relu, maxpool
 import numpy as np
 
 class Analyzer(ABC):
     name: str  # 子类定义，例如 "roofline" / "memory"
+    debug: bool = False
 
     def validate_input(self, op: OpIR, hw: HardwareConfig) -> None:
         # 基础检查：op 是 OpIR 子类，hw 是 HardwareConfig
@@ -241,8 +242,11 @@ class NumericalAnalyzer(Analyzer):
 
     def analyze_graph(self, irs, sample_input, exported) -> NumericalResult:
         weights  = self._extract_weights(exported)
-        out_fp32 = self._forward(irs, sample_input, weights, quantize=False)
-        out_q    = self._forward(irs, sample_input, weights, quantize=True)
+        out_fp32 = self._forward(irs, sample_input, weights, quantize=False, debug=self.debug)
+        out_q    = self._forward(irs, sample_input, weights, quantize=True,  debug=self.debug)
+        print(f"=== NumericalAnalyzer result ===")
+        print(f"  fp32 output: {out_fp32}")
+        print(f"  int8 output: {out_q}")
         error = np.abs(out_fp32 - out_q)
         return NumericalResult(
             max_error=float(error.max()),
@@ -276,21 +280,37 @@ class NumericalAnalyzer(Analyzer):
         return weights
 
     @staticmethod
-    def _forward(irs, sample_input, weights, quantize: bool):
+    def _forward(irs, sample_input, weights, quantize: bool, debug: bool = False):
         x = sample_input.astype(np.float32)
         wi = 0
         for ir in irs:
             if isinstance(ir, (Conv2dIR, MatMulIR)):
                 W, b = weights[wi]; wi += 1
-                W = W.astype(np.float32)
                 b = b.astype(np.float32) if b is not None else 0
                 if quantize:
-                    W = quantize_weight(W, ir.dtype)
-                x = conv2d(x, W, b) if isinstance(ir, Conv2dIR) else np_linear(x, W, b)
+                    # int8 x int8 → int32 accumulate, bias scaled to int32, dequantize out
+                    x_int8, _, scale_x = quantize_int8(x)
+                    W_int8, _, scale_w = quantize_int8(W.astype(np.float32))
+                    scale_b = scale_x * scale_w
+                    b_int32 = np.round(b / scale_b).astype(np.int32) if isinstance(b, np.ndarray) else 0
+                    x_int8 = x_int8.astype(np.int32)
+                    W_int8 = W_int8.astype(np.int32)
+                    if isinstance(ir, Conv2dIR):
+                        x = conv2d(x_int8, W_int8, b_int32).astype(np.float32) * scale_b
+                    else:
+                        x = np_linear(x_int8, W_int8, b_int32).astype(np.float32) * scale_b
+                    if debug:
+                        print(f"  [int8 {type(ir).__name__}] scale_x={scale_x:.4f} scale_w={scale_w:.4f} out={x.flatten()[:4]}")
+                else:
+                    x = conv2d(x, W.astype(np.float32), b) if isinstance(ir, Conv2dIR) else np_linear(x, W.astype(np.float32), b)
+                    if debug:
+                        print(f"  [fp32 {type(ir).__name__}] W={W.shape} x_out={x.flatten()[:4]}")
             elif isinstance(ir, ElementwiseIR):
                 if ir.op == "relu":      x = np_relu(x)
                 elif ir.op == "maxpool": x = maxpool(x)
                 elif ir.op == "flatten": x = x.flatten()
+                if debug:
+                    print(f"  [fp32 {ir.op}] x_out shape={x.shape}")
         return x
 
 class AnalysisPipeline:
