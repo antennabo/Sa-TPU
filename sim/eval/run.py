@@ -74,12 +74,11 @@ B = np.ones((K, N), dtype=np.int8)
 expected = A.astype(np.int32) @ B.astype(np.int32)
 print("Expected (numpy):\n", expected)
 
-mode = "IS"
 ca = CycleAccurateAnalyzer()
 ca.hw = hw
-ca.sa = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32, mode=mode)
+ca.sa = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32)
 ca.row_fifos = [FIFO() for _ in range(M)]
 ca.col_fifos = [FIFO() for _ in range(N)]
-ca.simulate(A, B, mode=mode)
+ca.simulate(A, B, mode="OS")
 # ca.simulate(A, B, mode="OS")
 # ca.simulate(A, B, mode="OS")

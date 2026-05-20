@@ -61,52 +61,59 @@ class CycleAccurateAnalyzer(Analyzer):
 
         dtype_map = {"int8": np.int8, "int16": np.int16, "int32": np.int32, "float32": np.float32}
         M, N = hw.mxu_dim
-        self.sa         = spatial_array(M, N, dtype_in=dtype_map[hw.dtype], dtype_acc=dtype_map[hw.accum_dtype], mode="OS")
+        self.sa         = spatial_array(M, N, dtype_in=dtype_map[hw.dtype], dtype_acc=dtype_map[hw.accum_dtype])
         self.row_fifos  = [FIFO() for _ in range(M)]
         self.col_fifos  = [FIFO() for _ in range(N)]
         self.all_modules = [self.sa] + self.row_fifos + self.col_fifos
 
         self.simulate(self.A_tiles[0, 0], self.B_tiles[0, 0], mode="OS")
 
+    _MODE_FLAGS = {
+        "OS": (True,  True),
+        "WS": (True,  False),
+        "IS": (False, True),
+    }
+
     def init_fifos(self, A_tile: np.ndarray, B_tile: np.ndarray, mode: str = "OS"):
         """
         将 tile 数据错排后写入 FIFO，支持脉动阵列三种数据流。
-        A_tile: (M, K)  — activation，按行送入 row_fifos
-        B_tile: (K, N)  — weight，  按列送入 col_fifos
-
-        WS: row i 前插 i 个 0，col_fifos 不使用
-        IS: col j 前插 j 个 0，row_fifos 不使用
-        OS: row i 前插 i 个 0，col j 前插 j 个 0
+        A_tile: (M, K)  — activation，按行送入 col_fifos（OS/WS）
+        B_tile: (K, N)  — weight，  按列送入 row_fifos（OS/IS）
         """
-        M, N = self.hw.mxu_dim
-        # tail = M + N - 2  # 尾部补零量（最大 i/j=0 时）
-        tail = M #+ N - 2  # 尾部补零量（最大 i/j=0 时）
+        shift_row, shift_col = self._MODE_FLAGS[mode]
+        M = self.hw.mxu_dim[0]
+        tail = M
 
-        if mode in ("WS", "OS"):
+        if shift_row:
             for i, fifo in enumerate(self.col_fifos):
                 fifo.load([0] * i + list(A_tile[i, :]) + [0] * (tail - i))
 
-        if mode in ("IS", "OS"):
+        if shift_col:
             for j, fifo in enumerate(self.row_fifos):
                 fifo.load([0] * j + list(B_tile[:, j]) + [0] * (tail - j))
 
     def control(self):
         M, N = self.hw.mxu_dim
-        mode  = self.sa.mode
-        self.sa.control()
+        shift_row, shift_col = self._MODE_FLAGS[self._mode]
 
-        if mode in ("OS", "WS"):
+        if shift_row:
+            self.sa.shift_row()
             col_data = [self.col_fifos[j].pop() for j in range(N)]
             if any(v is not None for v in col_data):
                 self.sa.load_row(0, [v if v is not None else 0 for v in col_data])
 
-        if mode in ("OS", "IS"):
+        if shift_col:
+            self.sa.shift_col()
             row_data = [self.row_fifos[i].pop() for i in range(M)]
             if any(v is not None for v in row_data):
                 self.sa.load_col(0, [v if v is not None else 0 for v in row_data])
 
+        if shift_row and shift_col:
+            self.sa.acc_local()
+
     def simulate(self, A_tile: np.ndarray, B_tile: np.ndarray, mode: str = "OS"):
         M, N = self.hw.mxu_dim
+        self._mode = mode
         self.sa.reset()
         self.init_fifos(A_tile, B_tile, mode)
 
