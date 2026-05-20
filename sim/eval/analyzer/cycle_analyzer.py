@@ -1,10 +1,11 @@
 import numpy as np
+from collections import deque
 from .analyzer import Analyzer
 from frontend.ir import OpIR, MatMulIR, Conv2dIR
 from backend.hw import HardwareConfig
 from .result import PerfResult
 from .sim_model.spatial_array import spatial_array
-from .sim_model.fifo import FIFO
+from .sim_model.tile_buf import TileBuf
 
 class CycleAccurateAnalyzer(Analyzer):
     name = "cycle_accurate"
@@ -17,6 +18,8 @@ class CycleAccurateAnalyzer(Analyzer):
         self._ops         = 0    # total FLOPs, set in layer2ops()
         self.A_tiles = []
         self.B_tiles = []
+        self.weight_tile_queue:     deque = deque()  # 临时 weight tile 队列（最多缓存2块）
+        self.activation_tile_queue: deque = deque()  # 临时 activation tile 队列（最多缓存2块）
 
     def analyze(self, op: OpIR, hw: HardwareConfig, A: np.ndarray, B: np.ndarray) -> PerfResult:
         self.hw           = hw
@@ -61,12 +64,22 @@ class CycleAccurateAnalyzer(Analyzer):
 
         dtype_map = {"int8": np.int8, "int16": np.int16, "int32": np.int32, "float32": np.float32}
         M, N = hw.mxu_dim
-        self.sa         = spatial_array(M, N, dtype_in=dtype_map[hw.dtype], dtype_acc=dtype_map[hw.accum_dtype])
-        self.row_fifos  = [FIFO() for _ in range(M)]
-        self.col_fifos  = [FIFO() for _ in range(N)]
-        self.all_modules = [self.sa] + self.row_fifos + self.col_fifos
+        self.sa        = spatial_array(M, N, dtype_in=dtype_map[hw.dtype], dtype_acc=dtype_map[hw.accum_dtype])
+        self.wb = TileBuf(N)
+        self.ab = TileBuf(M)
 
-        self.simulate(self.A_tiles[0, 0], self.B_tiles[0, 0], mode="OS")
+        # 将前两块 weight / activation tile 入队
+        self.weight_tile_queue.clear()
+        tn = self.B_tiles.shape[1]
+        for j in range(min(2, tn)):
+            self.weight_tile_queue.append(self.B_tiles[0, j])
+
+        self.activation_tile_queue.clear()
+        tm = self.A_tiles.shape[0]
+        for i in range(min(2, tm)):
+            self.activation_tile_queue.append(self.A_tiles[i, 0])
+
+        self.simulate(mode="OS")
 
     _MODE_FLAGS = {
         "OS": (True,  True),
@@ -74,23 +87,19 @@ class CycleAccurateAnalyzer(Analyzer):
         "IS": (False, True),
     }
 
-    def init_fifos(self, A_tile: np.ndarray, B_tile: np.ndarray, mode: str = "OS"):
-        """
-        将 tile 数据错排后写入 FIFO，支持脉动阵列三种数据流。
-        A_tile: (M, K)  — activation，按行送入 col_fifos（OS/WS）
-        B_tile: (K, N)  — weight，  按列送入 row_fifos（OS/IS）
-        """
-        shift_row, shift_col = self._MODE_FLAGS[mode]
+    def load_activation(self):
+        """Pop next tile from activation_tile_queue into ab inactive bank (if free)."""
         M = self.hw.mxu_dim[0]
-        tail = M
+        if not self.ab.pending and self.activation_tile_queue:
+            tile = self.activation_tile_queue.popleft()
+            self.ab.load([tile[i, :] for i in range(M)], tail=M)
 
-        if shift_row:
-            for i, fifo in enumerate(self.col_fifos):
-                fifo.load([0] * i + list(A_tile[i, :]) + [0] * (tail - i))
-
-        if shift_col:
-            for j, fifo in enumerate(self.row_fifos):
-                fifo.load([0] * j + list(B_tile[:, j]) + [0] * (tail - j))
+    def load_weight(self):
+        """Pop next tile from weight_tile_queue into wb inactive bank (if free)."""
+        M, N = self.hw.mxu_dim
+        if not self.wb.pending and self.weight_tile_queue:
+            tile = self.weight_tile_queue.popleft()
+            self.wb.load([tile[:, j] for j in range(N)], tail=M)
 
     def control(self):
         M, N = self.hw.mxu_dim
@@ -98,45 +107,56 @@ class CycleAccurateAnalyzer(Analyzer):
 
         if shift_row:
             self.sa.shift_row()
-            col_data = [self.col_fifos[j].pop() for j in range(N)]
+            col_data = [self.ab.output_fifo[j].pop() for j in range(N)]
             if any(v is not None for v in col_data):
                 self.sa.load_row(0, [v if v is not None else 0 for v in col_data])
 
         if shift_col:
             self.sa.shift_col()
-            row_data = [self.row_fifos[i].pop() for i in range(M)]
+            row_data = [self.wb.output_fifo[i].pop() for i in range(M)]
             if any(v is not None for v in row_data):
                 self.sa.load_col(0, [v if v is not None else 0 for v in row_data])
 
         if shift_row and shift_col:
             self.sa.acc_local()
 
-    def simulate(self, A_tile: np.ndarray, B_tile: np.ndarray, mode: str = "OS"):
-        M, N = self.hw.mxu_dim
+    def simulate(self, mode: str = "OS"):
         self._mode = mode
         self.sa.reset()
-        self.init_fifos(A_tile, B_tile, mode)
+        self.wb.reset()
+        self.ab.reset()
+        shift_row, shift_col = self._MODE_FLAGS[mode]
 
-        # broadcast stationary data directly from tile
-        if mode == "WS":
-            for j in range(N):
-                self.sa.load_col(j, B_tile[:, j])
-        elif mode == "IS":
-            for i in range(M):
-                self.sa.load_row(i, A_tile[i, :])
+        # 初始装载：第一块入 inactive → swap 为 active；第二块入 inactive（pending）
+        if shift_col:
+            self.load_weight()   # tile[0] → inactive bank
+            self.wb.swap()       # inactive → active
+            self.load_weight()   # tile[1] → inactive bank（若队列还有）
+        if shift_row:
+            self.load_activation()   # tile[0] → inactive bank
+            self.ab.swap()           # inactive → active
+            self.load_activation()   # tile[1] → inactive bank（若队列还有）
 
-        # while any(not f.empty() for f in self.row_fifos + self.col_fifos) or not self.sa.done:
-        while not self.sa.done:
+        while self.total_cycles < 50:
             self.control()
 
-            # Compute phase
+            # wb active bank drain 后切换到下一块
+            if shift_col and all(f.empty() for f in self.wb.output_fifo):
+                if self.wb.pending:
+                    self.wb.swap()
+                    print(f"[buf] wb swap at cycle {self.total_cycles}")
+                self.load_weight()  # 尝试将队列下一块装入 inactive
+
+            # ab active bank drain 后切换到下一块
+            if shift_row and all(f.empty() for f in self.ab.output_fifo):
+                if self.ab.pending:
+                    self.ab.swap()
+                    print(f"[buf] ab swap at cycle {self.total_cycles}")
+                self.load_activation()  # 尝试将队列下一块装入 inactive
+
             self.sa.compute()
-
-            # Commit phase
             self.sa.commit()
-
             self.total_cycles += 1
-            # print(f"[simulate] result:\n{self.sa.get_result()}")
             print(f"next cycle ->")
 
         print(f"[simulate] total_cycles={self.total_cycles}")

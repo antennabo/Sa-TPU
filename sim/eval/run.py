@@ -66,7 +66,7 @@ output = np.load("./tiles/layer3_output.npy")
 # --- debug: 小矩阵验证 ---
 from analyzer.cycle_analyzer import CycleAccurateAnalyzer
 from analyzer.sim_model.spatial_array import spatial_array
-from analyzer.sim_model.fifo import FIFO
+from analyzer.sim_model.tile_buf import TileBuf
 
 M, N, K = 8, 8, 8
 A = np.ones((M, K), dtype=np.int8)
@@ -77,8 +77,14 @@ print("Expected (numpy):\n", expected)
 ca = CycleAccurateAnalyzer()
 ca.hw = hw
 ca.sa = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32)
-ca.row_fifos = [FIFO() for _ in range(M)]
-ca.col_fifos = [FIFO() for _ in range(N)]
-ca.simulate(A, B, mode="OS")
-# ca.simulate(A, B, mode="OS")
-# ca.simulate(A, B, mode="OS")
+ca.wb = TileBuf(N)
+ca.ab = TileBuf(M)
+
+A2 = np.ones((M, K), dtype=np.int8) * 2
+B2 = np.ones((K, N), dtype=np.int8) * 2
+ca.weight_tile_queue.append(B)
+ca.weight_tile_queue.append(B2)
+ca.activation_tile_queue.append(A)
+ca.activation_tile_queue.append(A2)
+
+ca.simulate(mode="OS")
