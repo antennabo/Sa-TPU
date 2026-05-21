@@ -3,57 +3,84 @@ from .fifo import FIFO
 
 class TileBuf:
     """
-    Generic ping-pong tile buffer with staggered FIFO streaming.
+    Ping-pong tile buffer with per-lane bank switching.
 
-    load(vectors)  — DMA: stagger vectors into inactive FIFO bank
-                     vectors: list of N sequences, one per FIFO lane
-    swap()         — flip active ↔ inactive
-    output_fifo    — active FIFO bank; pop each cycle to feed the SA
-    pending        — inactive bank has data waiting for swap()
+    load(vectors)  — DMA: load vectors into each lane's inactive FIFO
+    swap()         — flip active bank for lanes whose active FIFO is empty,
+                     only when buffer-level pending is complete
+    pending        — True when ALL lanes have inactive data loaded
+    pop(j)         — pop one value from lane j's active FIFO
+    pop_all()      — pop one value from every lane's active FIFO
     reset()        — clear all state
+
+    Two states:
+        steady      — all lanes on the same active bank
+        transitioning — buffer pending complete; lanes switching as they drain
     """
 
     def __init__(self, N: int):
-        self.N          = N
-        self._fifo_bank = [[FIFO() for _ in range(N)],
-                           [FIFO() for _ in range(N)]]
-        self._active    = 0
-        self._pending   = False
+        self.N             = N
+        self._fifo_bank    = [[FIFO() for _ in range(N)],
+                              [FIFO() for _ in range(N)]]
+        self._active       = [0] * N       # FIFO-level: active bank index per lane
+        self._pending      = [False] * N   # FIFO-level: inactive bank has data
+        self._transitioning = False        # buffer-level: swap in progress
 
-    @property
-    def output_fifo(self) -> list:
-        """Active FIFO bank — SA pops from here each cycle."""
-        return self._fifo_bank[self._active]
-
-    def load(self, vectors: list, tail: int = None):
+    def load(self, vectors: list, add_head: bool = True, add_tail: bool = True,
+             lanes: list = None):
         """
-        Stagger vectors into inactive FIFO bank.
+        Load vectors into each lane's inactive FIFO with staggered skew.
 
-        vectors[j] is the data sequence for lane j.
-        Lane j is preceded by j zeros and followed by (tail-j) zeros.
-        tail defaults to N.
+        Lane j gets:
+            add_head=True  — j leading zeros  (first tile of a sequence)
+            add_tail=True  — (N-j) trailing zeros  (last tile of a sequence)
+            Both False     — data only, back-to-back with adjacent tiles.
+        lanes: list of lane indices to load; None means all.
         """
-        if tail is None:
-            tail = self.N
-        for j, (fifo, vec) in enumerate(zip(self._fifo_bank[1 - self._active], vectors)):
-            fifo.load([0] * j + list(vec) + [0] * (tail - j))
-        self._pending = True
+        if lanes is None:
+            lanes = range(self.N)
+        for j in lanes:
+            fifo = self._fifo_bank[1 - self._active[j]][j]
+            vec  = vectors[j]
+            head  = [0] * j            if add_head else []
+            drain = [0] * (self.N - j) if add_tail else []
+            fifo.load(head + list(vec) + drain)
+            self._pending[j] = True
 
     def swap(self):
-        """Flip active ↔ inactive. Raises if nothing is pending."""
-        if not self._pending:
-            raise RuntimeError("TileBuf: swap() called with no pending tile")
-        self._active  = 1 - self._active
-        self._pending = False
+        """
+        For each lane whose active FIFO is empty, switch it to the inactive bank.
+        Entry condition: buffer-level pending complete.
+        Continues until all lanes have switched (_transitioning cleared).
+        """
+        if self.pending:
+            self._transitioning = True
+        if not self._transitioning:
+            return
+        for j in range(self.N):
+            if self._pending[j] and self._fifo_bank[self._active[j]][j].empty():
+                self._active[j]  ^= 1
+                self._pending[j]  = False
+        if not any(self._pending):
+            self._transitioning = False
+
+    def pop(self, j: int):
+        """Pop one element from lane j's active FIFO."""
+        return self._fifo_bank[self._active[j]][j].pop()
+
+    def pop_all(self) -> list:
+        """Pop one element from every lane's active FIFO. Returns list of length N."""
+        return [self.pop(j) for j in range(self.N)]
 
     @property
     def pending(self) -> bool:
-        """True when the inactive bank has data waiting for swap()."""
-        return self._pending
+        """Buffer-level: True when ALL lanes have inactive data loaded."""
+        return all(self._pending)
 
     def reset(self):
-        self._active  = 0
-        self._pending = False
+        self._active        = [0] * self.N
+        self._pending       = [False] * self.N
+        self._transitioning = False
         for bank in self._fifo_bank:
             for fifo in bank:
                 fifo._q.clear()

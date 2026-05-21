@@ -69,22 +69,23 @@ from analyzer.sim_model.spatial_array import spatial_array
 from analyzer.sim_model.tile_buf import TileBuf
 
 M, N, K = 8, 8, 8
-A = np.ones((M, K), dtype=np.int8)
-B = np.ones((K, N), dtype=np.int8)
-expected = A.astype(np.int32) @ B.astype(np.int32)
-print("Expected (numpy):\n", expected)
+A = np.arange(1, M * K + 1, dtype=np.int8).reshape(M, K)
+B = np.arange(1, K * N + 1, dtype=np.int8).reshape(K, N)
+A2 = np.arange(1, M * K + 1, dtype=np.int8).reshape(M, K)
+B2 = np.arange(1, K * N + 1, dtype=np.int8).reshape(K, N)
+expected = (A.astype(np.int32) @ B.astype(np.int32)
+          + A2.astype(np.int32) @ B2.astype(np.int32))
+
 
 ca = CycleAccurateAnalyzer()
 ca.hw = hw
 ca.sa = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32)
 ca.wb = TileBuf(N)
 ca.ab = TileBuf(M)
-
-A2 = np.ones((M, K), dtype=np.int8) * 2
-B2 = np.ones((K, N), dtype=np.int8) * 2
 ca.weight_tile_queue.append(B)
 ca.weight_tile_queue.append(B2)
 ca.activation_tile_queue.append(A)
 ca.activation_tile_queue.append(A2)
 
 ca.simulate(mode="OS")
+print("Expected (numpy):\n", expected)

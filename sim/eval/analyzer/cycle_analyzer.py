@@ -87,35 +87,42 @@ class CycleAccurateAnalyzer(Analyzer):
         "IS": (False, True),
     }
 
-    def load_activation(self):
-        """Pop next tile from activation_tile_queue into ab inactive bank (if free)."""
+    def load_activation(self, add_head: bool = False, add_tail: bool = False) -> bool:
+        """Pop next tile from activation_tile_queue into ab inactive bank (if free).
+        Returns True if a tile was loaded."""
         M = self.hw.mxu_dim[0]
         if not self.ab.pending and self.activation_tile_queue:
             tile = self.activation_tile_queue.popleft()
-            self.ab.load([tile[i, :] for i in range(M)], tail=M)
+            self.ab.load([tile[i, :] for i in range(M)], add_head=add_head, add_tail=add_tail)
+            return True
+        return False
 
-    def load_weight(self):
-        """Pop next tile from weight_tile_queue into wb inactive bank (if free)."""
-        M, N = self.hw.mxu_dim
+    def load_weight(self, add_head: bool = False, add_tail: bool = False) -> bool:
+        """Pop next tile from weight_tile_queue into wb inactive bank (if free).
+        Returns True if a tile was loaded."""
+        _, N = self.hw.mxu_dim
         if not self.wb.pending and self.weight_tile_queue:
             tile = self.weight_tile_queue.popleft()
-            self.wb.load([tile[:, j] for j in range(N)], tail=M)
+            self.wb.load([tile[:, j] for j in range(N)], add_head=add_head, add_tail=add_tail)
+            return True
+        return False
 
     def control(self):
-        M, N = self.hw.mxu_dim
         shift_row, shift_col = self._MODE_FLAGS[self._mode]
 
         if shift_row:
             self.sa.shift_row()
-            col_data = [self.ab.output_fifo[j].pop() for j in range(N)]
-            if any(v is not None for v in col_data):
-                self.sa.load_row(0, [v if v is not None else 0 for v in col_data])
+            row_data = self.wb.pop_all()   # weight enters top, feeds b, shifts down
+            has_row  = any(v is not None for v in row_data)
+            self.sa.load_row(0, [v if v is not None else 0 for v in row_data],
+                             update_countdown=has_row)
 
         if shift_col:
             self.sa.shift_col()
-            row_data = [self.wb.output_fifo[i].pop() for i in range(M)]
-            if any(v is not None for v in row_data):
-                self.sa.load_col(0, [v if v is not None else 0 for v in row_data])
+            col_data = self.ab.pop_all()   # activation enters left, feeds a, shifts right
+            has_col  = any(v is not None for v in col_data)
+            self.sa.load_col(0, [v if v is not None else 0 for v in col_data],
+                             update_countdown=has_col)
 
         if shift_row and shift_col:
             self.sa.acc_local()
@@ -127,33 +134,19 @@ class CycleAccurateAnalyzer(Analyzer):
         self.ab.reset()
         shift_row, shift_col = self._MODE_FLAGS[mode]
 
-        # 初始装载：第一块入 inactive → swap 为 active；第二块入 inactive（pending）
-        if shift_col:
-            self.load_weight()   # tile[0] → inactive bank
-            self.wb.swap()       # inactive → active
-            self.load_weight()   # tile[1] → inactive bank（若队列还有）
-        if shift_row:
-            self.load_activation()   # tile[0] → inactive bank
-            self.ab.swap()           # inactive → active
-            self.load_activation()   # tile[1] → inactive bank（若队列还有）
-
+        first_wb = True
+        first_ab = True
         while self.total_cycles < 50:
+            if shift_col:
+                if self.load_weight(add_head=first_wb):
+                    first_wb = False
+                self.wb.swap()
+            if shift_row:
+                if self.load_activation(add_head=first_ab):
+                    first_ab = False
+                self.ab.swap()
+
             self.control()
-
-            # wb active bank drain 后切换到下一块
-            if shift_col and all(f.empty() for f in self.wb.output_fifo):
-                if self.wb.pending:
-                    self.wb.swap()
-                    print(f"[buf] wb swap at cycle {self.total_cycles}")
-                self.load_weight()  # 尝试将队列下一块装入 inactive
-
-            # ab active bank drain 后切换到下一块
-            if shift_row and all(f.empty() for f in self.ab.output_fifo):
-                if self.ab.pending:
-                    self.ab.swap()
-                    print(f"[buf] ab swap at cycle {self.total_cycles}")
-                self.load_activation()  # 尝试将队列下一块装入 inactive
-
             self.sa.compute()
             self.sa.commit()
             self.total_cycles += 1

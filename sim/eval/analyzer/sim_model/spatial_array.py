@@ -14,29 +14,29 @@ class spatial_array(module):
         self._did_shift_col = False
         self.done = False
 
-    def load_row(self, i, data):
-        """Load activations into row i: data[j] → pe[i][j].a"""
+    def load_row(self, i, data, update_countdown=True):
+        """Load weight into row i: data[j] → pe[i][j].b"""
         for j in range(self.N):
-            self.pes[i][j].load_a(data[j])
-        if i == 0:
+            self.pes[i][j].load_b(data[j])
+        if i == 0 and update_countdown:
             self._row_countdown = self.N
             self.done = False
 
-    def load_col(self, j, data):
-        """Load weight into column j: data[i] → pe[i][j].b"""
+    def load_col(self, j, data, update_countdown=True):
+        """Load activation into column j: data[i] → pe[i][j].a"""
         for i in range(self.M):
-            self.pes[i][j].load_b(data[i])
-        if j == 0:
+            self.pes[i][j].load_a(data[i])
+        if j == 0 and update_countdown:
             self._col_countdown = self.M
             self.done = False
 
     def shift_row(self):
-        """Shift a values top→bottom + propagate psum top→bottom (WS)."""
-        a_snap     = [[self.pes[i][j].a     for j in range(self.N)] for i in range(self.M)]
+        """Shift b (weight) values top→bottom + propagate psum top→bottom."""
+        b_snap     = [[self.pes[i][j].b     for j in range(self.N)] for i in range(self.M)]
         state_snap = [[self.pes[i][j].state for j in range(self.N)] for i in range(self.M)]
         for i in range(1, self.M):
             for j in range(self.N):
-                self.pes[i][j].load_a(a_snap[i - 1][j])
+                self.pes[i][j].load_b(b_snap[i - 1][j])
         for j in range(self.N):
             self.pes[0][j].acc = self.pes[0][j].dtype_state(0)
         for i in range(1, self.M):
@@ -45,12 +45,12 @@ class spatial_array(module):
         self._did_shift_row = True
 
     def shift_col(self):
-        """Shift b values left→right + propagate psum left→right (IS)."""
-        b_snap     = [[self.pes[i][j].b     for j in range(self.N)] for i in range(self.M)]
+        """Shift a (activation) values left→right + propagate psum left→right."""
+        a_snap     = [[self.pes[i][j].a     for j in range(self.N)] for i in range(self.M)]
         state_snap = [[self.pes[i][j].state for j in range(self.N)] for i in range(self.M)]
         for i in range(self.M):
             for j in range(1, self.N):
-                self.pes[i][j].load_b(b_snap[i][j - 1])
+                self.pes[i][j].load_a(a_snap[i][j - 1])
         for i in range(self.M):
             self.pes[i][0].acc = self.pes[i][0].dtype_state(0)
         for i in range(self.M):
