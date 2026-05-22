@@ -1,37 +1,45 @@
 from collections import deque
+from .module import module
 
 
-class FIFO:
+class FIFO(module):
     """
-    通用硬件 FIFO 模型。
+    Cycle-accurate FIFO model.
+    Follows compute/commit pattern.
 
-    depth       — 最大容量（None 表示无限）
-    push(item)  — 写入一个元素；满时抛出 OverflowError
-    pop()       — 读出一个元素；空时返回 None
-    peek()      — 查看队头，不消耗
-    load(items) — 批量写入
-    full()      — 是否已满
-    empty()     — 是否为空
+    push(item)  -- write to tail immediately (DMA-side input)
+    load(items) -- batch push
+    compute()   -- peek head -> next_state
+    commit()    -- pop head, state = next_state
+    state       -- head value from last commit (None if was empty)
+    full()      -- combinational: queue at capacity
+    empty()     -- combinational: queue has no elements
     """
 
     def __init__(self, depth=None):
-        self.depth = depth
-        self._q = deque()
+        super().__init__()
+        self.depth      = depth
+        self._q         = deque()
+        self.state      = None
+        self.next_state = None
 
     def push(self, item):
         if self.depth is not None and len(self._q) >= self.depth:
             raise OverflowError(f"FIFO full (depth={self.depth})")
         self._q.append(item)
 
-    def pop(self):
-        return self._q.popleft() if self._q else None
-
-    def peek(self):
-        return self._q[0] if self._q else None
-
     def load(self, items):
         for item in items:
             self.push(item)
+
+    def compute(self):
+        self.next_state = self._q[0] if self._q else None
+
+    def commit(self):
+        if self._q:
+            self._q.popleft()
+        self.state      = self.next_state
+        self.next_state = None
 
     def full(self):
         return self.depth is not None and len(self._q) >= self.depth
@@ -41,3 +49,8 @@ class FIFO:
 
     def __len__(self):
         return len(self._q)
+
+    def reset(self):
+        self._q.clear()
+        self.state      = None
+        self.next_state = None

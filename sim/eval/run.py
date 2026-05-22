@@ -66,7 +66,8 @@ output = np.load("./tiles/layer3_output.npy")
 # --- debug: 小矩阵验证 ---
 from analyzer.cycle_analyzer import CycleAccurateAnalyzer
 from analyzer.sim_model.spatial_array import spatial_array
-from analyzer.sim_model.tile_buf import TileBuf
+from analyzer.sim_model.common_buf import CommonBuf
+from analyzer.sim_model.accumulator import Accumulator
 
 M, N, K = 8, 8, 8
 A = np.arange(1, M * K + 1, dtype=np.int8).reshape(M, K)
@@ -78,10 +79,12 @@ expected = (A.astype(np.int32) @ B.astype(np.int32)
 
 
 ca = CycleAccurateAnalyzer()
-ca.hw = hw
-ca.sa = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32)
-ca.wb = TileBuf(N)
-ca.ab = TileBuf(M)
+ca.hw    = hw
+ca.sa    = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32)
+ca.wb    = CommonBuf(N)
+ca.ab    = CommonBuf(M)
+ca.accum = Accumulator(num_lanes=M)
+ca._K    = K
 ca.weight_tile_queue.append(B)
 ca.weight_tile_queue.append(B2)
 ca.activation_tile_queue.append(A)
