@@ -1,0 +1,85 @@
+Sa-TPU ISA 定义草案
+===================
+最后更新：2026-05-21
+指令总位宽：64bit，opcode：8bit
+
+一、硬件规格（已确认）
+-----------------------
+MXU         : 8x8, int8 输入 / int32 累加，1 tile = 64B（激活）/ 256B（累加，int32）
+Weight 存储  : Weight FIFO，256KB（4096 tile 深度，1 tile = 64B）
+激活存储     : Unified Buffer，256KB（4096 tile，ub_addr 16bit 预留）
+Accumulator : 4KB（16 tile，accum_addr 4bit）
+DRAM        : 32位地址空间（当前 512MB，预留扩展至 4GB）
+DDR 接口    : 16bit
+指令风格     : CISC（对标 TPU v1）
+BRAM 分配   : Weight FIFO 256KB + UB 256KB + Accum 4KB = 516KB / 640KB
+
+二、指令集总览
+--------------
+阶段一（当前）：ARM 负责所有数据搬运，TPU 只做计算
+编号  指令        功能
+0     MATMUL      UB x Weight FIFO → MXU → Accumulators
+1     ACTIVATE    Accumulators → (非线性函数) → UB
+
+阶段二（后续）：TPU 通过 AXI Master 自主拉取权重
+编号  指令        功能
+0     LOAD_WGT    DDR → Weight FIFO（权重，PL AXI Master）
+1     MATMUL      UB x Weight FIFO → MXU → Accumulators
+2     ACTIVATE    Accumulators → (非线性函数) → UB
+
+注：卷积不单独设指令，由前端 im2col 展开后复用 MATMUL。
+注：LOAD_ACT 和 STORE 由 ARM（PS 侧）通过 AXI/DMA 直接操作 UB，不作为 TPU 指令。
+
+三、指令字段定义
+----------------
+
+[LOAD_ACT]  （省略，ARM DMA 负责）
+[STORE]     （省略，ARM DMA 负责）
+
+[LOAD_WGT]
+功能   : 从 DRAM 加载权重数据到 Weight FIFO
+        63     56 55          24 23   20 19        0
+字段   : | opcode | dram_addr   | length | reserved  |
+位宽   :     8         32           4         20       = 64bit
+- opcode    [63:56] : 8bit
+- dram_addr [55:24] : 权重在 DRAM 中的起始地址（字节对齐），32bit
+- length    [23:20] : 传输 tile 数，单位 tile（1 tile = 64B），最大 16 tile，4bit
+- reserved  [19: 0] : 20bit 预留
+
+[MATMUL]
+功能   : UB x Weight FIFO → MXU → Accumulators
+       : 激活值由 MATMUL 内部从 UB 自动填入（硬件隐含 setup，用户不感知）
+        63     56 55      40 39    36 35    32 31       30        29        0
+字段   : | opcode | ub_addr | accum  | length | is_first | is_last | reserved |
+位宽   :     8        16         4        4         1          1        30      = 64bit
+- opcode     [63:56] : 8bit
+- ub_addr    [55:40] : 激活值在 UB 中的起始地址，16bit（预留，实际需 12bit）
+- accum_addr [39:36] : 结果写入 Accumulator SRAM 的起始地址，4bit（16 tile）
+- length     [35:32] : 本条指令计算的 tile 数，4bit，最大 16 tile
+- is_first   [31]    : 1 = 清零 Accumulator 后开始累积（TBD：is_first/is_last vs accumulate）
+- is_last    [30]    : 1 = 本条为 K 维最后一块
+- reserved   [29: 0] : 30bit
+
+[ACTIVATE]
+功能   : Accumulators → (非线性函数) → UB
+        63     56 55      40 39    36 35    32 31        0
+字段   : | opcode | ub_addr  | accum  | func   | reserved  |
+位宽   :     8        16         4        4         32       = 64bit
+- opcode     [63:56] : 8bit
+- ub_addr    [55:40] : 输出，UB 起始地址，16bit（预留）
+- accum_addr [39:36] : 输入，Accumulator 起始地址，4bit（16 tile）
+- func       [35:32] : 激活函数类型，4bit（最多 16 种），暂不支持 MaxPool / BatchNorm
+  0x0 = Linear, 0x1 = ReLU, 0x2 = ReLU6, 0x3 = Sigmoid, 0x4 = Tanh, ...
+- reserved   [31: 0] : 32bit（预留给 scale 或其他扩展，存放方式 TBD）
+
+四、待定项（TBD）
+-----------------
+- UB 大小 → 影响所有 ub_addr 位宽（MATMUL / ACTIVATE）
+- Accumulator SRAM 大小 → 影响 accum_addr 位宽（MATMUL / ACTIVATE）
+- MATMUL K 维分块首尾标识方案（is_first+is_last 或 accumulate）
+- LOAD_ACT 字段（等 UB 大小确认后定）
+- Decoupled Access-Execute 同步机制（dependency tag）
+- ACTIVATE scale 参数存放方式（定点：multiplier[31:0] + shift[7:0]）
+  方案A：放指令里（64bit 不够，需扩展到 128bit）
+  方案B：存 UB，指令只带地址
+  方案C：专用寄存器，提前用单独指令配置
