@@ -1,6 +1,9 @@
+import logging
 import numpy as np
 from .module import module
 from .pe import pe
+
+logger = logging.getLogger(__name__)
 
 class spatial_array(module):
     def __init__(self, M, N, dtype_in=np.int8, dtype_acc=np.int32):
@@ -75,12 +78,14 @@ class spatial_array(module):
         self.done = False
 
     def compute(self):
-        print("  [compute]")
-        for i in range(self.M):
-            a   = [int(self.pes[i][j].a)   for j in range(self.N)]
-            b   = [int(self.pes[i][j].b)   for j in range(self.N)]
-            acc = [int(self.pes[i][j].acc) for j in range(self.N)]
-            print(f"    row{i}  a={a}  b={b}  acc={acc}")
+        if logger.isEnabledFor(logging.DEBUG):
+            fmt = lambda vs: '[' + ', '.join(f'{v:4d}' for v in vs) + ']'
+            logger.debug("[compute]")
+            for i in range(self.M):
+                a   = [int(self.pes[i][j].a)   for j in range(self.N)]
+                b   = [int(self.pes[i][j].b)   for j in range(self.N)]
+                acc = [int(self.pes[i][j].acc) for j in range(self.N)]
+                logger.debug("  row%d  a=%s  b=%s  acc=%s", i, fmt(a), fmt(b), fmt(acc))
 
         for i in range(self.M):
             for j in range(self.N):

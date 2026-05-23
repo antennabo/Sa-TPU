@@ -65,10 +65,10 @@ output = np.load("./tiles/layer3_output.npy")
 
 # --- debug: 小矩阵验证 ---
 from analyzer.cycle_analyzer import CycleAccurateAnalyzer
-from analyzer.sim_model.spatial_array import spatial_array
-from analyzer.sim_model.common_buf import CommonBuf
-from analyzer.sim_model.accumulator import Accumulator
-
+from analyzer.instr import MatMulInstr
+import logging
+# 开 DEBUG 看所有 FSM 转换 + drain/load 动作
+logging.basicConfig(level=logging.DEBUG, format="%(name)s %(message)s")
 M, N, K = 8, 8, 8
 A = np.arange(1, M * K + 1, dtype=np.int8).reshape(M, K)
 B = np.arange(1, K * N + 1, dtype=np.int8).reshape(K, N)
@@ -77,18 +77,13 @@ B2 = np.arange(1, K * N + 1, dtype=np.int8).reshape(K, N)
 expected = (A.astype(np.int32) @ B.astype(np.int32)
           + A2.astype(np.int32) @ B2.astype(np.int32))
 
-
-ca = CycleAccurateAnalyzer()
-ca.hw    = hw
-ca.sa    = spatial_array(M, N, dtype_in=np.int8, dtype_acc=np.int32)
-ca.wb    = CommonBuf(N)
-ca.ab    = CommonBuf(M)
-ca.accum = Accumulator(num_lanes=M)
-ca._K    = K
+ca = CycleAccurateAnalyzer(hw)
 ca.weight_tile_queue.append(B)
 ca.weight_tile_queue.append(B2)
 ca.activation_tile_queue.append(A)
 ca.activation_tile_queue.append(A2)
+ca.instr_queue.append(MatMulInstr(ub_addr=0, accum_addr=0))
+ca.instr_queue.append(MatMulInstr(ub_addr=1, accum_addr=1))
 
 ca.simulate(mode="OS")
 print("Expected (numpy):\n", expected)
