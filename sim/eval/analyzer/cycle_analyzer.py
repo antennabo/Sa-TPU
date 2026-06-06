@@ -38,28 +38,17 @@ class CycleAccurateAnalyzer(Analyzer):
     def _setup(self, hw: HardwareConfig):
         dtype_map = {"int8": np.int8, "int16": np.int16, "int32": np.int32, "float32": np.float32}
         M, N = hw.mxu_dim
-        self.hw    = hw
-        self.sa    = spatial_array(M, N, dtype_in=dtype_map[hw.dtype], dtype_acc=dtype_map[hw.accum_dtype])
-        self.wb    = CommonFIFO(N)
-        self.ab    = CommonFIFO(M)
-        self.accum = Accumulator(num_rows=M, num_cols=N)
+        self.hw         = hw
+        self.M, self.N  = M, N
+        self._dtype_in  = dtype_map[hw.dtype]
+        self._dtype_acc = dtype_map[hw.accum_dtype]
+        self._latency   = getattr(hw, "pe_latency", 1)  # PE 流水级数（drain/restore 延迟 = latency+1）
+        # module 在 simulate() 拿到 tile 的 K 后再建（K=sizek，_setup 时未知）
 
     def analyze(self, op: OpIR, hw: HardwareConfig, A: np.ndarray, B: np.ndarray) -> PerfResult:
         self.hw           = hw
         self.instr_queue  = []
         self.total_cycles = 0
-
-        # self.load_tiles(op, A, B)
-        # self.simulate(self.instr_queue)
-
-        # return PerfResult(
-        #     model_name="cycle_accurate",
-        #     confidence="accurate",
-        #     latency_ns=latency_ns,
-        #     utilization=peak_cycles / self.total_cycles,
-        #     throughput_ops=self._ops / latency_ns,
-        #     pipeline_bubbles=0,
-        # )
 
     def load_tiles(self, tiles_dir: str, layer: str = "layer3"):
         """
@@ -70,118 +59,77 @@ class CycleAccurateAnalyzer(Analyzer):
         self.B_tiles = np.load(f"{tiles_dir}/{layer}_B_tiles.npy")  # (tk, tn, sizek, sizen)
         self.bias = np.load(f"{tiles_dir}/{layer}_bias.npy")
 
-    def analyze_from_tiles(self, tiles_dir: str, hw: HardwareConfig, layer: str = "layer3") -> PerfResult:
-        self.total_cycles = 0
-        self._setup(hw)
-        self.load_tiles(tiles_dir, layer)
-        self._K = self.A_tiles.shape[3]
-
-        # 将前两块 weight / activation tile 入队
-        self.weight_tile_queue.clear()
-        tn = self.B_tiles.shape[1]
-        for j in range(min(2, tn)):
-            self.weight_tile_queue.append(self.B_tiles[0, j])
-
-        self.activation_tile_queue.clear()
-        tm = self.A_tiles.shape[0]
-        for i in range(min(2, tm)):
-            self.activation_tile_queue.append(self.A_tiles[i, 0])
-
-        self.simulate(mode="OS")
+    def _reconstruct(self):
+        """把 4D tile 拼回完整 A[Gm,Gk]、B[Gk,Gn]。
+        A_tiles (tm,tk,M,K)：A[mi*M:.., kc*K:..]=A_tiles[mi,kc]
+        B_tiles (tk,tn,K,N)：B[kc*K:.., nj*N:..]=B_tiles[kc,nj]
+        """
+        tm, tk, M, K = self.A_tiles.shape
+        tk2, tn, K2, N = self.B_tiles.shape
+        assert tk == tk2 and K == K2, f"A/B tile 的 K 维不一致：A tk={tk},K={K} vs B tk={tk2},K={K2}"
+        A = np.zeros((tm * M, tk * K), dtype=self.A_tiles.dtype)
+        for mi in range(tm):
+            for kc in range(tk):
+                A[mi * M:(mi + 1) * M, kc * K:(kc + 1) * K] = self.A_tiles[mi, kc]
+        B = np.zeros((tk * K, tn * N), dtype=self.B_tiles.dtype)
+        for kc in range(tk):
+            for nj in range(tn):
+                B[kc * K:(kc + 1) * K, nj * N:(nj + 1) * N] = self.B_tiles[kc, nj]
+        return A, B
 
     def simulate(self, mode: str = "OS"):
+        """从 load_tiles 的 tile 跑周期级 OS 矩阵乘。沿用已验证的调度（块间流水、块内 K-chunk
+        无缝累加、new_tile 只在块间边界拍）。结果留在 self.accum（get_tile 可逐块查）。"""
         self._mode = mode
-        shift_row, shift_col = Controller._MODE_FLAGS[mode]
-        M, N = self.hw.mxu_dim
+        A, B = self._reconstruct()
+        tm, tk, M, K = self.A_tiles.shape
+        _, tn, _, N = self.B_tiles.shape
+        assert M == self.M and N == self.N, f"tile 尺寸 {M}x{N} 与阵列 {self.M}x{self.N} 不符"
+        self._K = K
+        rows, cols, cpb = tm, tn, tk
+        Gk, nblocks = tk * K, rows * cols
+        assert nblocks <= Accumulator.NUM_TILES, f"块数 {nblocks} 超过 accumulator 容量 {Accumulator.NUM_TILES}"
 
-        self.sa.reset()
-        self.wb.reset()
-        self.ab.reset()
-        self.accum.reset()
-        self.total_cycles = 0
+        lat = self._latency
+        self.ctrl  = Controller(M, N, K, drain_delay=lat + 1)
+        self.wb    = CommonFIFO(N, K)
+        self.ab    = CommonFIFO(M, K)
+        self.sa    = spatial_array(M, N, dtype_in=self._dtype_in, dtype_acc=self._dtype_acc, latency=lat)
+        self.accum = Accumulator(num_rows=M, num_cols=N)
+        for m in (self.ctrl, self.wb, self.ab, self.sa, self.accum):
+            m.reset()
+        ZEROS = [[0] * N for _ in range(M)]
 
-        if self._K is None and self.weight_tile_queue:
-            self._K = self.weight_tile_queue[0].shape[0]
+        # 预载所有块所有 K-chunk（tile_id 升序：mi 外、nj 内、kc 内）
+        for mi in range(rows):
+            for nj in range(cols):
+                for kc in range(cpb):
+                    for kk in range(K):
+                        kd = kc * K + kk
+                        self.wb.update([int(B[kd, nj * N + c]) for c in range(N)], [0] * N); self.wb.commit()
+                        self.ab.update([int(A[mi * M + r, kd]) for r in range(M)], [0] * M); self.ab.commit()
 
-        self.ctrl = Controller(M, N, 0, mode)
+        n_run = nblocks * Gk + M + N + lat + 10
+        last_write = 0
+        for cy in range(n_run):
+            new_tile = cy > 0 and cy % Gk == 0 and cy < nblocks * Gk
+            self.ctrl.update(cy, self.wb.avail, self.ab.avail, new_tile=new_tile)
+            self.wb.update(None, self.ctrl.read_weight)
+            self.ab.update(None, self.ctrl.read_activation)
+            self.accum.update(self.sa.data, self.ctrl.acc, self.ctrl.acc_read)
+            self.sa.update(self.ab.data, self.wb.data, 1, 1, 0, 0, ZEROS, self.ctrl.acc_read)
+            self.ctrl.commit(); self.wb.commit(); self.ab.commit(); self.accum.commit(); self.sa.commit()
+            if any(self.ctrl.acc[r][c] is not None for r in range(M) for c in range(N)):
+                last_write = cy
+        self.total_cycles = last_write + 1
 
-        num_issued = 0
-
-        while self.instr_queue or self.total_cycles < 50:
-            # Fetch and issue
-            if self.instr_queue:
-                instr = self.instr_queue.popleft()
-                if isinstance(instr, MatMulInstr):
-                    self.ctrl.issue(instr)
-                    num_issued += 1
-
-            # Compute controller inputs
-            has_row = any(v is not None for v in self.wb.state) if shift_row else False
-            has_col = any(v is not None for v in self.ab.state) if shift_col else False
-
-            # Control: compute next state + output signals
-            self.ctrl.control(
-                has_row=has_row,
-                has_col=has_col,
-                wb_pending=self.wb.pending,
-                ab_pending=self.ab.pending,
-                weight_available=bool(self.weight_tile_queue),
-                activ_available=bool(self.activation_tile_queue),
-            )
-
-            # Execute control signals
-            if self.ctrl.load_weight:
-                tile = self.weight_tile_queue.popleft()
-                self.wb.load([tile[:, j] for j in range(N)],
-                             add_head=self.ctrl.weight_add_head)
-
-            if self.ctrl.load_activation:
-                tile = self.activation_tile_queue.popleft()
-                self.ab.load([tile[i, :] for i in range(M)],
-                             add_head=self.ctrl.activ_add_head)
-
-            pe_ready  = self.ctrl.pe_result_ready
-            data      = [self.sa.pes[pe_ready[j]][j].state if pe_ready[j] is not None else None
-                         for j in range(N)]
-            self.accum.load_write(self.ctrl.drain_tile_id, pe_ready, data)
-            logger.debug("[drain  ] cy=%d row_list=%s data=%s", self.total_cycles, pe_ready, data)
-
-            if self.ctrl.drive_sa:
-                if shift_row:
-                    self.sa.shift_row()
-                    self.sa.load_row(0, [v if v is not None else 0 for v in self.wb.state],
-                                     update_countdown=has_row)
-                if shift_col:
-                    self.sa.shift_col()
-                    self.sa.load_col(0, [v if v is not None else 0 for v in self.ab.state],
-                                     update_countdown=has_col)
-                if shift_row and shift_col:
-                    self.sa.acc_local()
-
-            if self.ctrl.buf_advance:
-                if shift_col:
-                    self.wb.request_read()
-                if shift_row:
-                    self.ab.request_read()
-            self.sa.compute()
-            self.accum.compute()
-
-            # Commit
-            self.ctrl.commit()
-            if self.ctrl.buf_advance:
-                if shift_col:
-                    self.wb.output()
-                if shift_row:
-                    self.ab.output()
-            self.sa.commit()
-            self.accum.commit()
-
-            self.total_cycles += 1
-            logger.debug("cycle %d", self.total_cycles)
-
-        logger.info("[simulate] total_cycles=%d", self.total_cycles)
-        for t in range(self.ctrl._tile_id):
-            logger.info("[simulate] accum tile %5d:", t)
-            for i, row in enumerate(self.accum.get_tile(t)):
-                logger.info("  row %" \
-                "d: %5s", i, row)
+        # 拼回结果 + 自检（基准 = 拼回的 int32 A@B；out.npy 是反量化后的最终输出，不在此比）
+        C = np.zeros((rows * M, cols * N), dtype=np.int32)
+        for mi in range(rows):
+            for nj in range(cols):
+                C[mi * M:(mi + 1) * M, nj * N:(nj + 1) * N] = np.array(self.accum.get_tile(mi * cols + nj))
+        self.result = C
+        ref = A.astype(np.int32) @ B.astype(np.int32)
+        logger.info("[simulate] total_cycles=%d  numeric_ok=%s  C.shape=%s",
+                    self.total_cycles, bool(np.array_equal(C, ref)), C.shape)
+        return C

@@ -63,27 +63,12 @@ output = np.load("./tiles/layer3_output.npy")
 # sim.cycle.analyze_from_tiles("./tiles", hw, layer="layer3")
 # sim.run_cycle(exported)
 
-# --- debug: 小矩阵验证 ---
+# --- 周期级模拟：从 tile 跑 OS 矩阵乘 ---
 from analyzer.cycle_analyzer import CycleAccurateAnalyzer
-from analyzer.instr import MatMulInstr
 import logging
-# 开 DEBUG 看所有 FSM 转换 + drain/load 动作
-logging.basicConfig(level=logging.DEBUG, format="%(name)s %(message)s")
-M, N, K = 8, 8, 8
-A = np.arange(1, M * K + 1, dtype=np.int8).reshape(M, K)
-B = np.arange(1, K * N + 1, dtype=np.int8).reshape(K, N)
-A2 = np.arange(1, M * K + 1, dtype=np.int8).reshape(M, K)
-B2 = np.arange(1, K * N + 1, dtype=np.int8).reshape(K, N)
-expected = (A.astype(np.int32) @ B.astype(np.int32)
-          + A2.astype(np.int32) @ B2.astype(np.int32))
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 ca = CycleAccurateAnalyzer(hw)
-ca.weight_tile_queue.append(B)
-ca.weight_tile_queue.append(B2)
-ca.activation_tile_queue.append(A)
-ca.activation_tile_queue.append(A2)
-ca.instr_queue.append(MatMulInstr(ub_addr=0, accum_addr=0))
-ca.instr_queue.append(MatMulInstr(ub_addr=1, accum_addr=1))
-
-ca.simulate(mode="OS")
-print("Expected (numpy):\n", expected)
+ca.load_tiles("./tiles", layer="layer3")
+C = ca.simulate(mode="OS")
+print("cycle-accurate C shape:", C.shape, "total_cycles:", ca.total_cycles)

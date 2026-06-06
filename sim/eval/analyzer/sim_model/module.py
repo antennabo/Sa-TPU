@@ -6,7 +6,7 @@ class module:
         self.state       = dtype_state(0)
         self.next_state  = dtype_state(0)
 
-    def compute(self):
+    def update(self):
         pass
 
     def commit(self):
