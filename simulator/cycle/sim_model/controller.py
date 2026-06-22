@@ -12,17 +12,10 @@ class OSState(Enum):
     OVERLAP_SEAMLESS = auto()  # 最老 tile drain 与后继 feed 重叠，无气泡
     OVERLAP_GAP      = auto()  # 最老 tile drain，后继被数据饥饿卡住（气泡拍）
 
-class WSState(Enum):
-    IDLE   = auto()  # 无活跃 tile
-    WLOAD  = auto()  # 冷启动：首 tile 权重逐拍移入 shadow（AR 拍，暴露）
-    STREAM = auto()  # 连续喂 F 行激活 + 反对角线 switch 波前 + 后台 shadow load + capture
-    STALL  = auto()  # 预留：activation 饥饿 / weight 没备好 → feed+switch 冻结、capture 继续
-    DRAIN  = auto()  # 末 tile 排空剩余 psum（仅 capture），到最后一个 capture → IDLE
-
 class Controller(module):
+    # WS 路径已拆出，统一用 simulator.cycle.sim_model.controller_ws_ref.ControllerWSRef
     _MODE_FLAGS = {
         "OS": (True,  True),
-        "WS": (True,  False),
         "IS": (False, True),
     }
     _LOAD_TO_PE = 2  # load pulse 到该 tile 首元素到达 PE(0,0) 的延迟（buffer load→state→feed）
@@ -135,73 +128,13 @@ class Controller(module):
         D = self._restore_delay
         self._acc_rst_next = [self._acc_read_sr_next[r + D] for r in range(self.M)]
 
-    # ================================================================== #
-    # WS 路径（独立状态机 + 四道波前；pe/sa 不知 mode）。见 doc/WS_weight_design.md
-    # ================================================================== #
-    def _next_ws_state(self, weight_available: bool, activ_available: bool):
-        cs, cnt = self.ws_state, self._ws_cnt
-        AR, AC, F = self.M, self.N, self._K
-        avail = weight_available and activ_available    # 权重(载 shadow)+激活都就绪
-        self.ws_state_next = cs
-        self._ws_cnt_next  = cnt + 1
-        if cs == WSState.IDLE:
-            self._ws_cnt_next = 0
-            if activ_available:                          # 有激活就启动；权重在 WLOAD 里载（避免空 shadow 死锁）
-                self.ws_state_next = WSState.WLOAD
-        elif cs == WSState.WLOAD:                        # 载 shadow：sa 每列反压全拉起 = 灌满
-            if weight_available:                         # = sa [N] 反压全拉起（不再 controller 数 AR 拍）
-                self.ws_state_next = WSState.STREAM
-                self._ws_cnt_next = 0
-        elif cs == WSState.STREAM:                       # 喂 F 行激活
-            if cnt == F - 1:
-                self.ws_state_next = WSState.STREAM if avail else WSState.DRAIN
-                self._ws_cnt_next = 0
-            # STALL 预留：avail 但数据没齐 / tile 内饥饿 → STALL（v1 不触发）
-        elif cs == WSState.STALL:                        # 预留
-            if avail:
-                self.ws_state_next = WSState.STREAM
-                self._ws_cnt_next = 0
-        elif cs == WSState.DRAIN:                        # 排空到最后一个 capture
-            if cnt == AR + AC + self._latency - 2:       # = cap_delay + AC - F... 跑测试钉死
-                self.ws_state_next = WSState.IDLE
-                self._ws_cnt_next = 0
-        # switch 注入：首 tile WLOAD→STREAM 恒切；STREAM 边界 switch_weight 切
-        nxt = self.ws_state_next
-        cold     = (cs == WSState.WLOAD and nxt == WSState.STREAM)
-        boundary = (cs == WSState.STREAM and cnt == F - 1 and nxt == WSState.STREAM
-                    and self._switch_weight)
-        self._ws_switch_inject = cold or boundary
-
-    def _ws_feed(self):
-        # 标量 feed（STREAM 期间喂激活）；activation 的 skew 由 ab buf 内部传播（activation_buf 设计待写）
-        self._feed_next = (self.ws_state_next == WSState.STREAM)
-
-    def _ws_switch(self):
-        # b_sw[k]=switch_sr[k]：左边缘按行 skew 注入，列向 +c 由 sa 右推（成对角线 k+n）。
-        # 与旧 w_switch[k][n]=sr[k+n] 几何等价（把 +c 从 controller 挪给 sa）。
-        self._ws_switch_sr_next = [self._ws_switch_inject] + self._ws_switch_sr[:-1]
-        self._b_sw_next = [self._ws_switch_sr_next[k] for k in range(self.M)]
-
-    def _ws_capture(self):
-        # capture 标量注入：STREAM 喂行 m=cnt_next 时输出 (m, wr_tile=tag)，否则 None。
-        # per-column 对齐（psum 下流 AR 行 + 流水 cap_delay）由下游随 psum 传播，controller 不算 [N]。
-        # wr_tile 与 OS drain 槽同一语义（§14-D）。
-        if self.ws_state_next == WSState.STREAM:
-            self._ws_m_next       = self._ws_cnt_next
-            self._ws_wr_tile_next = self._tag
-        else:
-            self._ws_m_next       = None
-            self._ws_wr_tile_next = None
-
     # ------------------------------------------------------------------ #
     # Public interface
     # ------------------------------------------------------------------ #
 
     def update(self, cycle, weight_available: bool, activ_available: bool,
-               new_tile: bool = False, tile_id: int = 0,
-               switch_weight: bool = False, tag: int = 0):
+               new_tile: bool = False, tile_id: int = 0):
         self._cycle = cycle
-        # mode 在此显形：OS/WS 各自独立状态机 + 信号生成（IS 待实现）。pe/sa 不知 mode。
         if self._mode == "OS":
             self._new_tile    = new_tile     # 新输出块：写 _new_tile_id + psum overwrite(=0)
             self._new_tile_id = tile_id      # 新块写入的 accumulator 槽（指令 accum_addr）
@@ -213,18 +146,11 @@ class Controller(module):
             self._os_feed()                                         # ③ 输出组合（依赖 _os_state_next）
             self._os_drain()
             self._os_restore()
-        elif self._mode == "WS":
-            self._switch_weight = switch_weight
-            self._tag           = tag
-            self._next_ws_state(weight_available, activ_available)  # ② 次态
-            self._ws_feed()                                         # ③ 三道控制波（feed/switch/capture）
-            self._ws_switch()                                       #   权重载入走 wb↔sa 自握手，controller 不产
-            self._ws_capture()
         else:
             raise NotImplementedError(f"mode {self._mode} 未实现")
 
     def commit(self):
-        # 第一段：时序，纯锁存 reg = reg_next（无任何逻辑）。按 mode 分支锁存各自寄存器。
+        # 第一段：时序，纯锁存 reg = reg_next（无任何逻辑）。
         if self._mode == "OS":
             self.os_state        = self._os_state_next
             self._cnt            = self._cnt_next
@@ -235,25 +161,14 @@ class Controller(module):
             self.output_sel = self._output_sel_next  # 左边缘每行 drain 使能(bool [M])，sa 右传成波前
             self.wr_tile    = self._wr_tile_next     # 标量目的槽 tile_id（给 accum；drain 不重叠）
             self.acc_rst    = self._acc_rst_next     # 左边缘每行 reset 使能(bool [M])，sa 右传成波前
-        elif self._mode == "WS":
-            self.ws_state        = self.ws_state_next
-            self._ws_cnt         = self._ws_cnt_next
-            self.feed            = self._feed_next       # 标量 feed（给 ab buf，内部传播出 skew）
-            self._ws_switch_sr   = self._ws_switch_sr_next
-            self.b_sw            = self._b_sw_next          # 左边缘每行换权重使能(bool [M])，sa 右推成 k+n
-            self.m               = self._ws_m_next          # 标量：本拍喂的输出行（None=非 STREAM）
-            self.wr_tile         = self._ws_wr_tile_next    # 标量：写哪个槽（= 旧 tag，同 OS 语义）
 
     def reset(self):
         self._cycle = 0  # 仅用于打印
-        # 共享输出（OS/WS 都用）：标量 feed（skew 由下游 fifo/buf 内部传播生成）
+        # 标量 feed（skew 由下游 fifo/buf 内部传播生成）
         self.feed       = False
         self._feed_next = False
-        # 按 mode 只初始化各自寄存器（与 update/commit 对称）
         if self._mode == "OS":
             self._reset_os()
-        elif self._mode == "WS":
-            self._reset_ws()
         else:
             raise NotImplementedError(f"mode {self._mode} 未实现")
 
@@ -285,23 +200,3 @@ class Controller(module):
         self._wr_tile_next = 0
         self.wr_tile = 0
 
-    def _reset_ws(self):
-        # AR=self.M 行=K, AC=self.N 列=N, F=self._K=M
-        AR = self.M
-        self.ws_state            = WSState.IDLE
-        self.ws_state_next       = WSState.IDLE
-        self._ws_cnt             = 0
-        self._ws_cnt_next        = 0
-        self._switch_weight      = False    # 输入：边界是否换权重
-        self._tag                = 0        # 输入：当前 tile 标识 → 打进 capture
-        self._ws_switch_inject   = False    # 本拍是否往 switch SR 注入（首 tile 恒切 / 边界 switch_weight）
-        # switch SR（长 AR，行 skew）→ b_sw[k]=sr[k]；列向 +c 由 sa 右推（旧 sr[k+n] 的 +c 移到 sa）
-        self._ws_switch_sr       = [False] * AR
-        self._ws_switch_sr_next  = [False] * AR
-        # 输出
-        self.b_sw          = [False] * AR     # 左边缘每行换权重使能(bool [M])
-        self._b_sw_next    = [False] * AR
-        self.m             = None             # 标量：本拍喂的输出行（None=非 STREAM）
-        self._ws_m_next    = None
-        self.wr_tile       = 0                # 标量：写哪个槽（= 旧 tag，同 OS 语义）
-        self._ws_wr_tile_next = None

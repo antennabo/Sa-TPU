@@ -84,25 +84,56 @@ python scripts/run.py
 
 ### RTL 仿真与逐拍对拍（cosim）
 
-让 RTL 阵列 `rtl/systolic_array.sv` 跟 Python golden（`simulator/cycle/sim_model/`）逐拍比对。
-思路：golden 跑一遍 WS 计算、把每拍的边界激励和底行输出录成向量；testbench 回放同样的输入、
-逐拍比对输出。需要 `iverilog` / `vvp`（看波形再装 `gtkwave`）。
+让 RTL 阵列 `rtl/systolic_array.sv` 跟 Python golden（`simulator/cycle/sim_model/spatial_array.py`）
+逐拍比对。思路：通用 dump 函数 `_dump_sa_ws(A, B, AR, AC, ...)` 接受**完整** A (M×AR) 和 B (AR×N)，
+自动按 N 方向切 `G_N = N // AC` 个 tile 串行执行 WS（`WLOAD B[0] → sw → STREAM_i + WLOAD B[i+1] → ...`），
+逐拍录下 `sa.data[AR-1]` 作为 golden；testbench 用同一份 .txt 喂 RTL 比对。
+
+工具链：VCS（编译 + 跑）+ verdi（看 fsdb 波形）。
 
 ```bash
-# 1. 生成逐拍向量 build/sa_cosim/ws1.txt（latency=2 对应 RTL PIPE_MUL=1）
-python -m pytest simulator/cycle/sim_model/ws1_e2e_test.py::test_ws1_dump_cosim
+# 1. 生成逐拍向量 build/sa_cosim/ws_switch.txt
+python -m pytest -k test_ws_dump
 
-# 2. 进 testcase 目录跑 testbench
+# 2. 进 testcase 目录跑 RTL（默认 -t switch）
 cd tb/sa_tb
-python run_test.py sa_tb          # 逐拍比对，打印 PASS / MISMATCH
-python run_test.py sa_tb -vcd     # 额外生成 cpu_wave.vcd，gtkwave 看波形
+python run_vcs.py                 # 编译 + 跑，打印 PASS / MISMATCH
+python run_vcs.py -wave           # 同上 + 跑完自动 verdi 打开 cpu_wave.fsdb
+python run_vcs.py -fsdb           # 只 dump fsdb，不自动开 verdi
+python run_vcs.py -clean          # 清 VCS 产物 (simv / csrc / verdiLog / ...)
 ```
 
-testcase 名 `sa_tb` 仅用于命名。新增一个被测模块时，在 `tb/` 下照 `sa_tb/` 建一个目录
-（含 `*.sv` / `filelist_tb.f` / `run_test.py`）即可。
+**改矩阵 / 加新用例：**
 
-> 注意：testbench 读阵列输出走层次化引用 `dut.out[i]`，不读顶层端口 `out[i]`——
-> iverilog 对 unpacked array 输出端口传播有缺陷，直接读端口会得到 X（是仿真器限制，非 RTL 缺陷）。
+1. 编辑 `simulator/cycle/tests/sa_test.py::test_ws_dump`（或仿照它新建一个 test 函数），
+   改 `A` / `B` / `AR` / `AC` / `dump_path`。约束：K 维度（`A.shape[1]` 和 `B.shape[0]`）必须 = `AR`；
+   N 维度（`B.shape[1]`）必须能整除 `AC`。
+2. 改 `tb/sa_tb/run_vcs.py::TESTS` 字典里对应条目的 `row` / `col` 跟 `AR` / `AC` 对上
+   （否则 sa_tb 编译会用错维度 → "FATAL: 维度不匹配"）；新用例就加新 key。
+3. 重跑上面的两步。
+
+`tb/sa_tb/sa_tb.sv` 通过 `+define+SA_ROW_N=N +define+SA_COL_N=M` 编译时参数化，
+通过 `+TXT=<path>` plusarg 运行时指定 golden 文件——`run_vcs.py` 自动按 TESTS 字典传这些。
+
+**weight_fifo（[tb/wfifo_tb/](tb/wfifo_tb/)）—— 同一套机制，被测对象换成 [rtl/weight_fifo.sv](rtl/weight_fifo.sv)**
+
+`_dump_wfifo_ws(weights, ready_seq, dump_path)`（[simulator/cycle/tests/wfifo_test.py](simulator/cycle/tests/wfifo_test.py)）
+用 `commonfifo.py::CommonFIFO.ws_update` 跑一遍逐拍，dump 每拍
+`(cy, wvalid, wdata[N], ready[N], vld[N], data[N])` 到 `build/wfifo_cosim/ws.txt`；
+wfifo_tb 用同一份 .txt 喂 RTL，比对 `vld/data`。
+
+```bash
+# 1. 生成 golden
+python -m pytest -k test_wfifo_ws_dump_cosim
+
+# 2. 跑 RTL
+cd tb/wfifo_tb
+python run_vcs.py                 # 默认 -t ws
+python run_vcs.py -wave           # + 自动 verdi 打开 fsdb
+```
+
+`tb/wfifo_tb/wfifo_tb.sv` 通过 `+define+WFIFO_N=N +define+WFIFO_DEPTH=D` 配置；改激励 / 加新用例的姿势跟
+sa_tb 一致（改 pytest 里的 `weights` / `ready_seq` + 同步 `TESTS` 字典里的 `n` / `depth`）。
 
 ### 其它脚本
 

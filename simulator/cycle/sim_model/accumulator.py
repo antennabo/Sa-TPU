@@ -18,7 +18,9 @@ class Accumulator(module):
 
     vld/row/slot/add 一起标量注入；per-column 由内部传播 SR 铺开（§8）：注入端进 (vld,row,slot,add)，
     列 c 延 (c + cap_delay) 拍读出该列的 (vld,row,slot,add)，vld 为真才写 _mem[slot][row][c]（add 则 +=）。
-    cap_delay = 把标量地址对齐到 per-column psum 逐列吐出的延迟（构造给；WS=(AR-1)+L+1，OS=L+1）。
+    cap_delay 默认 0：调用方（controller）已经把信号对齐到 col 0 psum 到达时刻，accumulator 只做
+    column-stagger（列 c 延 c 拍）。需要 accumulator 同时做 pipeline 对齐的场景（sa-only dump 等）
+    可以传 cap_delay > 0，列 0 也延 cap_delay 拍。
     """
 
     NUM_TILES = 16
@@ -38,7 +40,7 @@ class Accumulator(module):
         self._sr_next = [(False, 0, 0, False)] * L
 
     def update(self, values, vld, row, slot, add):
-        # 标量 (vld,row,slot,add) 注入端、逐拍移；列 c 延 (c + cap_delay) 取本列地址，vld 真才写
+        # 标量 (vld,row,slot,add) 注入端、逐拍右移；列 c 延 (c + cap_delay) 拍读出本列地址，vld 真才写
         self._sr_next = [(bool(vld), row, slot, bool(add))] + self._sr[:-1]
         self._pending = []
         for c in range(self.N):

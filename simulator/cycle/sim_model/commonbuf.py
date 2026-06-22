@@ -10,12 +10,15 @@ class CommonBuf(module):
     地址 {page, tile_id, row}：page=ping-pong 双缓冲页（switch_page 占位，后续指令解析驱动）；
     一个线性自加指针同时表 {tile_id, row}（addr // K = tile_id，addr % K = row），封顶 = tile_num*K。
 
+    输出寄存 1 拍：data/vld 是 sdpram REG_OUT=0 + rd_vld FF 的行为镜像——本拍 update 计算出的
+    读结果在【本拍 commit 后】就在 data/vld 上可见（1 个 FF 延迟），跟 RTL activation_buf 对齐。
+
     update(wdata, feed, tile_num=1):
       wdata    -- DMA 本拍写入的一条深度向量 [N]（None/False 则不写）；写当前 page，存住不消费
       feed     -- 标量：这拍喂不喂。内部 _prop：lane c 在 feed 之后第 c 拍点亮、否则出 0
       tile_num -- 当前 page 内 tile 数；读指针封顶 = tile_num*K（到顶归 0）
-    data       -- list[N] 本拍各 lane 输出（点亮=读指针处的值，未点亮=0），commit 后有效
-    vld        -- list[N] 各 lane 本拍是否点亮（给 sa 当 a_vld/b_vld）
+    data       -- list[N] 各 lane 输出（上一拍读的结果，1 拍输出寄存），commit 后有效
+    vld        -- list[N] 各 lane 输出是否有效（上一拍的点亮，跟 data 同节拍）
     switch_page() -- ping-pong 切页（占位，后续指令解析驱动）：翻活动页、读指针归 0
     """
 
@@ -61,9 +64,11 @@ class CommonBuf(module):
         self._ptr_next = ptr_next
 
     def commit(self):
-        self.data = self.data_next
-        self.vld  = list(self._rd)                       # 点亮的 lane = 读了真数据
-        self._ptr = self._ptr_next
+        # 1 拍输出寄存：本拍 update 算出来的 data_next/_rd 在 commit 后立即变成可见 data/vld
+        # （sdpram REG_OUT=0 + rd_vld FF：1 个 FF 延迟，跟 RTL activation_buf 对齐）
+        self.data  = list(self.data_next)
+        self.vld   = list(self._rd)
+        self._ptr  = self._ptr_next
         self._prop = self._prop_next
 
     def switch_page(self):

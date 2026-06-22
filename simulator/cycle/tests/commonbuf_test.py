@@ -4,6 +4,9 @@ from simulator.cycle.sim_model.commonbuf import CommonBuf
 class TestCommonBuf:
     """CommonBuf：写口存当前页、标量 feed → 内部 lane 传播生成 skew（同 fifo）、读指针自加、
     封顶 tile_num*K 归 0 复用、ping-pong 切页。见 doc/common_buf_design.md。
+
+    输出寄存 1 拍（对齐 RTL activation_buf：sdpram REG_OUT=0 + rd_vld FF）：
+      第 t 拍 update 触发的读 → 第 t 拍 commit 后 data/vld 立即反映出来（1 个 FF）。
     """
 
     def tick(self, b, wdata, feed, tile_num=1):
@@ -16,7 +19,7 @@ class TestCommonBuf:
             self.tick(b, vec, False)
 
     def test_scalar_feed_generates_skew(self):
-        # 与 CommonFIFO 同款 skew：lane c 延 c 拍点亮，按深度递增
+        # 与 CommonFIFO 同款 skew：lane c 延 c 拍点亮；1 拍输出寄存 → data 当拍 commit 就出
         b = CommonBuf(N=3, K=3)
         tile = [[0 + d, 10 + d, 20 + d] for d in range(3)]   # [K][N]
         self.preload(b, tile)
@@ -24,12 +27,12 @@ class TestCommonBuf:
         for _ in range(b.K + b.N):
             self.tick(b, None, True)
             outs.append(list(b.data))
-        # lane0 立刻吐深度 0,1,2
+        # lane0：触发 t=0..2 读 0,1,2 → outs[0..2]
         assert outs[0][0] == 0 and outs[1][0] == 1 and outs[2][0] == 2
-        # lane1 延 1 拍
+        # lane1：延 1 拍 → outs[1..3]
         assert outs[0][1] == 0
         assert outs[1][1] == 10 and outs[2][1] == 11 and outs[3][1] == 12
-        # lane2 延 2 拍
+        # lane2：延 2 拍 → outs[2..4]
         assert outs[0][2] == 0 and outs[1][2] == 0
         assert outs[2][2] == 20 and outs[3][2] == 21 and outs[4][2] == 22
 
@@ -38,7 +41,7 @@ class TestCommonBuf:
         self.preload(b, [[1, 2], [3, 4]])
         self.tick(b, None, False)             # feed=False → 全 0、不读
         assert b.data == [0, 0]
-        self.tick(b, None, True)              # feed=True → lane0 读指针处取数
+        self.tick(b, None, True)              # 触发 lane0 读 → 当拍 commit 后即出
         assert b.data[0] == 1
 
     def test_pointer_wraps_at_tile_num_K(self):
@@ -46,7 +49,7 @@ class TestCommonBuf:
         b = CommonBuf(N=1, K=2)
         self.preload(b, [[5], [6]])           # _buf[page][0] = [5, 6]
         seen = []
-        for _ in range(5):                    # 读 5 拍，应循环 5,6,5,6,5
+        for _ in range(5):                    # 读 5 拍
             self.tick(b, None, True, tile_num=1)
             seen.append(b.data[0])
         assert seen == [5, 6, 5, 6, 5]
@@ -60,7 +63,7 @@ class TestCommonBuf:
         for _ in range(6):
             self.tick(b, None, True, tile_num=2)
             seen.append(b.data[0])
-        assert seen == [10, 11, 20, 21, 10, 11]     # 扫满 4 行后归 0 重来
+        assert seen == [10, 11, 20, 21, 10, 11]
 
     def test_switch_page_isolates_data(self):
         # ping-pong：page0 写一份、切页 page1 写另一份；切回 page0 数据仍在（双缓冲隔离）
@@ -68,16 +71,16 @@ class TestCommonBuf:
         self.tick(b, [100], False)            # page0 存 100
         b.switch_page()
         self.tick(b, [200], False)            # page1 存 200
-        self.tick(b, None, True, tile_num=1)  # 读 page1
+        self.tick(b, None, True, tile_num=1)  # 触发读 page1，当拍 commit 后即出
         assert b.data[0] == 200
         b.switch_page()                       # 切回 page0（读指针归 0）
-        self.tick(b, None, True, tile_num=1)
+        self.tick(b, None, True, tile_num=1)  # 触发读 page0
         assert b.data[0] == 100               # page0 数据未被 page1 覆盖
 
     def test_vld_marks_lit_lanes(self):
         b = CommonBuf(N=2, K=1)
         self.preload(b, [[7, 8]])
-        self.tick(b, None, True)              # lane0 点亮取数
+        self.tick(b, None, True)              # 触发 lane0 读 → 当拍 commit 后即出
         assert b.vld == [True, False] and b.data[0] == 7
-        self.tick(b, None, False)             # feed 落，但脉冲右推 → lane1 这拍点亮
-        assert b.vld == [False, True]
+        self.tick(b, None, False)             # lane1 由 prop 右推触发；feed 关掉 prop[0]=False
+        assert b.vld == [False, True] and b.data[1] == 8

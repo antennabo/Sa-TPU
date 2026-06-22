@@ -41,7 +41,9 @@ class spatial_array(module):
         # acc_clr[M]/b_sw[M]：左边缘逐行注入的控制（右推成对角图案）；output_sel 预留(出口读出，见 §12)
         a_in, a_vin          = self._route_a(a_data, a_vld)
         b_in, b_vin, b_rdy   = self._route_b(b_data, b_vld)
-        bsw_g                = self._shift_right(self._bsw_grid, b_sw)
+        # b_sw 第 0 列也打 1 拍 FF（用 self._bsw_edge），跟 a 的 data_buf 第 0 列对齐
+        bsw_g                = self._shift_right_reg_edge(self._bsw_grid, self._bsw_edge)
+        self._bsw_edge_next  = [bool(b_sw[r]) if b_sw is not None else False for r in range(self.M)]
         clr_g                = self._shift_right(self._clr_grid, acc_clr)
         out_g                = self._shift_right(self._out_grid, output_sel)  # OS drain 读出波
         acc_in               = self._route_acc(clr_g)
@@ -135,11 +137,19 @@ class spatial_array(module):
         edge = lambda r: bool(inject[r]) if inject is not None else False
         return [[edge(r) if c == 0 else grid[r][c - 1] for c in range(N)] for r in range(M)]
 
+    def _shift_right_reg_edge(self, grid, edge_reg):
+        """右推一格 + 第 0 列也是 registered（用 edge_reg = 上拍 commit 的 inject）：
+        col 0 = edge_reg[r]，col c+1 = grid[r][c]（上拍）。下拍 inject 通过 _bsw_edge_next 注入。
+        这样 col 0 也有 1 拍 FF，跟 RTL 的 b_sw_grid[row][0] always_ff 对齐。"""
+        M, N = self.M, self.N
+        return [[edge_reg[r] if c == 0 else grid[r][c - 1] for c in range(N)] for r in range(M)]
+
     def commit(self):
         for row in self.pes:
             for P in row:
                 P.commit()
         self._bsw_grid = self._bsw_grid_next
+        self._bsw_edge = self._bsw_edge_next      # 第 0 列 edge FF 也 commit
         self._clr_grid = self._clr_grid_next
         self._out_grid = self._out_grid_next
         self.output  = self._output_next
@@ -150,6 +160,8 @@ class spatial_array(module):
                 P.reset()
         F = lambda: [[False] * self.N for _ in range(self.M)]
         self._bsw_grid = F(); self._bsw_grid_next = F()
+        self._bsw_edge = [False] * self.M         # b_sw 第 0 列 edge FF（跟 RTL b_sw_grid[row][0] 对齐）
+        self._bsw_edge_next = [False] * self.M
         self._clr_grid = F(); self._clr_grid_next = F()
         self._out_grid = F(); self._out_grid_next = F()
         self.output  = [0] * self.N; self._output_next  = [0] * self.N

@@ -24,9 +24,11 @@ module pe #(
     input  logic                clk,
     input  logic                rst_n,
     input  logic [A_W-1:0]      a,
+    input  logic                a_vld,
     input  logic [B_W-1:0]      b,
     input  logic [OUT_W-1:0]    c,
     output logic [OUT_W-1:0]    result,
+    output logic                result_vld,
     output logic                overflow
 );
 
@@ -109,5 +111,26 @@ always_ff @(posedge clk or negedge rst_n) begin : output_reg
         overflow <= overflow_calc;
     end
 end
+
+// a_vld 跟着 result pipeline 一起延迟（PIPE_MUL=1 → 2 拍，PIPE_MUL=0 → 1 拍）
+generate
+    if (PIPE_MUL == 1'b1) begin : gen_vld_pipe_mul
+        logic vld_mul_q;
+        always_ff @(posedge clk or negedge rst_n) begin
+            if (!rst_n) begin
+                vld_mul_q  <= 1'b0;
+                result_vld <= 1'b0;
+            end else begin
+                vld_mul_q  <= a_vld;
+                result_vld <= vld_mul_q;
+            end
+        end
+    end else begin : gen_vld_no_pipe_mul
+        always_ff @(posedge clk or negedge rst_n) begin
+            if (!rst_n) result_vld <= 1'b0;
+            else        result_vld <= a_vld;
+        end
+    end
+endgenerate
 
 endmodule
