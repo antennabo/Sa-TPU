@@ -1,3 +1,10 @@
+> ⚠ **DEPRECATED** — accumulator 早期设计稿。当前 RTL `rtl/accumulator.sv` 实现概要
+> 收进 [../controller_ws.md](../controller_ws.md) 的接口表。本文中 OS drain mux / restore 等
+> 内容是 OS 路径产物，OS 不再落地。WS 现实现：per-column 标量地址 SR（长度 AC）+
+> per-column sdpram、v1 只 overwrite（无 add）。保留为历史参考；新工作请读 doc/ 根下的新版。
+
+---
+
 # accumulator 设计（输出累加器：drain / capture 写回 C，per-column 地址传播）
 
 本文档写给**第一次接触本项目**的读者，自顶向下：先讲 accumulator 要解决什么，再讲整体、接口、细节。
@@ -180,3 +187,95 @@ update(values, vld, row, slot, add):
 | `cap_delay` | `(AR-1)+L+1`：把标量地址对齐到底行 psum 逐列吐出的延迟 |
 | 累加（`+=`）| K 切段时同槽同位置叠加部分和；N 切块则覆写新槽 |
 | `_pending` | 本拍待落盘的写 `(slot,row,col,val)`；`commit` 落盘 |
+
+---
+
+# 第五部分 · RTL 实现 plan（v1）
+
+## 13. 范围
+
+v1 只对齐 sim 现状，对应 WS-1 单 K-chunk：
+
+- **只覆写**，不带 `o_wr_add`。controller 当前没发 `add`（[controller_ws.sv:79-81](../rtl/controller_ws.sv#L79-L81) 只有 `o_wr_vld/o_wr_row/o_wr_tile`），accumulator 端口对齐这一现状。K 切段累加（§9）等 controller 引入 K-chunk 语义后再回头一起补。
+- **同步读出口**：`(i_rd_slot, i_rd_row) → o_rd_data[AC]`，1 拍 latency，给 tb / 上层一个最简单的取数路径。streaming dump 不做。
+- `cap_delay` 对齐由 controller 完成（[tinytpu_top.sv:60-63](../rtl/tinytpu_top.sv#L60-L63) 注释："已 CAP_DELAY 对齐到 col 0 psum 到达时刻"），accumulator RTL 内的 SR 长度 = `AC`，**只做 0..AC-1 拍的 column skew**（Python `Accumulator(cap_delay=0)` 那条路径）。
+
+## 14. 模块接口
+
+```sv
+module accumulator #(
+    parameter int AC          = 8,    // 列数（= SA COL_N）
+    parameter int OUT_W       = 32,   // psum 位宽
+    parameter int NUM_SLOTS   = 16,   // = 1 << TAG_W
+    parameter int ROW_MAX     = 32,   // = TILE_NUM_MAX * W；上层算出来传进来
+    localparam int SLOT_W     = $clog2(NUM_SLOTS),
+    localparam int ROW_W      = $clog2(ROW_MAX)
+)(
+    input  logic                  clk,
+    input  logic                  rst_n,
+
+    // ── 数据面（来自 SA 顶层 o_out / o_out_vld）──
+    input  logic [OUT_W-1:0]      i_psum     [AC],
+    input  logic                  i_psum_vld [AC],   // 列 c 上 psum 有效
+
+    // ── 地址面（来自 controller，已对齐 col 0）──
+    input  logic                  i_wr_vld,          // 标量
+    input  logic [ROW_W-1:0]      i_wr_row,          // 标量
+    input  logic [SLOT_W-1:0]     i_wr_slot,         // 标量
+
+    // ── 读出口（同步读，1 拍 latency）──
+    input  logic                  i_rd_en,
+    input  logic [SLOT_W-1:0]     i_rd_slot,
+    input  logic [ROW_W-1:0]      i_rd_row,
+    output logic [OUT_W-1:0]      o_rd_data  [AC]
+);
+```
+
+- 数据面用 SA 的 `i_psum_vld[c]` 作为该列 psum 真到达的 gate；写真值的条件 = `i_psum_vld[c] && sr[c].vld`。两套 valid 在硬件上是同源 + 同延迟（都是 col 0 对齐 + 列 c 延 c 拍），冗余的 AND 只是防御性。
+- 不暴露 `o_wr_add` 入口（见 §13）。
+
+## 15. 内部数据通路
+
+```
+i_wr_vld / i_wr_row / i_wr_slot ──┐
+                                  ▼   长度 AC 的 SR（每拍右移）
+                            sr[0]──sr[1]──sr[2]── ... ──sr[AC-1]
+                              │      │      │              │
+                              ▼      ▼      ▼              ▼   列 c 取 sr[c]
+                       _mem[slot][row][0..AC-1]   ← 写：i_psum[c] when sr[c].vld
+```
+
+- `sr` 元素 = `{vld, row, slot}`，类型用 `struct packed` 或三个并行数组。
+- 每拍一律右移；rst_n 时全清 0。
+- `sr[c].vld && i_psum_vld[c]` 为真，下一拍把 `i_psum[c]` 写到 `_mem[sr[c].slot][sr[c].row][c]`。
+
+存储用 `logic [OUT_W-1:0] mem [NUM_SLOTS][ROW_MAX][AC]`，让综合工具自行选 distributed RAM 还是 BRAM。第一版不强约束实现。
+
+## 16. 时序
+
+- **写**：第 `t` 拍 controller 注入标量，第 `t+c` 拍写入第 `c` 列（与 sim `cap_delay=0` 行为一致）。无 `_pending`/`commit` 两段；RTL 上写直接落 mem。
+- **读**：`i_rd_en` 拉高同拍寄存 `(i_rd_slot, i_rd_row)`，下一拍出 `o_rd_data[AC]`（同步读 BRAM 风格）。
+- **读写同 slot/row 同拍**：v1 不保证 read-before-write 还是 write-before-read，调用方避免 hazard；tb 在 `commit done` 之后才发读。
+
+## 17. 集成到 tinytpu_top
+
+- 把 [tinytpu_top.sv](../rtl/tinytpu_top.sv) 里目前 expose 出去的 `o_wr_row/o_wr_tile/o_wr_vld + o_out/o_out_vld` 改成内部连进 `u_accum`。
+- 顶层新增读口 `i_rd_en/i_rd_slot/i_rd_row + o_rd_data[AC]`。
+- 顶层参数透传：`AC=AC, OUT_W=OUT_W, NUM_SLOTS=(1<<TAG_W), ROW_MAX=TILE_NUM_MAX*W`。
+
+## 18. tb 计划
+
+新建 `tb/accum_tb/`：
+
+1. **单元向量**：直接驱动 `i_psum/i_wr_*`，验证 column skew、覆写、`vld=0` 时不写。
+2. **与 controller 串联**：复用现有 `ctrl_ws_tb` 的 scenario，把 controller 的 `o_wr_*` 接进 accumulator，再用读口对照 Python `Accumulator` 的 `_mem`。这一步把 sim 端 ws1 e2e 等价于硬件 ws1 e2e。
+
+集成后 (`tinytpu_top` 含 accum) 的 e2e 对拍放到 `tb/tpu_top_tb/`，对照 [tpu_top_test.py](../simulator/cycle/tests/tpu_top_test.py)。
+
+## 19. 待做（v2+）
+
+| 项 | 触发条件 |
+|---|---|
+| `o_wr_add` 端口 + `+=` 写路径 | controller 引入 K-chunk 语义，能发 `add=1` |
+| OS drain 入口（同 update） | OS 控制器接入 |
+| BRAM 实现强约束 / dual-port 控制 | 综合阶段发现 LUT 紧 / 时序紧 |

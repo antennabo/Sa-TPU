@@ -1,3 +1,10 @@
+> ⚠ **DEPRECATED** — activation buf 早期设计稿（CommonBuf 模型）。当前 RTL
+> `rtl/activation_buf.sv` 是纯被动的 per-lane RAM（外部驱动地址、无 page / 自动 skew）。
+> 行 skew + 地址生成都由 controller 内的 `offset[AR]` SR 完成（见
+> [../controller_ws.md](../controller_ws.md)）。保留为历史参考；新工作请读 doc/ 根下的新版。
+
+---
+
 # common buf 设计（CommonBuf：可寻址缓冲，存一整层数据、标量 feed 斜读、可重读复用）
 
 本文档写给**第一次接触本项目**的读者，自顶向下：先讲 common buf 要解决什么，再讲整体、接口、细节。

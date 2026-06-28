@@ -130,6 +130,17 @@ python -m pytest -k test_wfifo_ws_dump_cosim
 cd tb/wfifo_tb
 python run_vcs.py                 # 默认 -t ws
 python run_vcs.py -wave           # + 自动 verdi 打开 fsdb
+
+
+# 1) 生成 switch.txt（包含 inputs + golden）
+pytest -k test_tpu_top_dump_switch
+
+# 2) 进 tb 目录，跑 VCS
+cd tb/tpu_top_tb
+python run_vcs.py -t switch              # 只跑 sim
+python run_vcs.py -t switch -fsdb        # + 出 cpu_wave.fsdb 波形
+python run_vcs.py -t switch -wave        # + 自动 verdi 打开
+python run_vcs.py -clean                 # 清理产物
 ```
 
 `tb/wfifo_tb/wfifo_tb.sv` 通过 `+define+WFIFO_N=N +define+WFIFO_DEPTH=D` 配置；改激励 / 加新用例的姿势跟
@@ -142,9 +153,14 @@ sa_tb 一致（改 pytest 里的 `weights` / `ready_seq` + 同步 `TESTS` 字典
 
 ## 设计文档
 
-设计细节见 [doc/](doc/)，按模块组织，例如 `SA_array_design.md`（脉动阵列）、
-`controller_design.md`（控制器）、`accumulator_design.md`（累加器）、
-`WS_weight_design.md` / `OS_restore_design.md`（WS / OS 两种数据流）、`isa.txt`（指令集）。
+入口：[doc/README.md](doc/README.md)。结构：
+- [doc/architecture.md](doc/architecture.md) — 系统总览（先读这个）
+- [doc/systolic_array.md](doc/systolic_array.md) — sa + pe + 权重双缓冲
+- [doc/controller_ws.md](doc/controller_ws.md) — 6 态 FSM + 三道控制波 + 邻接接口
+- [doc/decisions.md](doc/decisions.md) — 设计决策日志
+- [doc/roadmap.md](doc/roadmap.md) — RV core + TPU 联动路线
+- [doc/isa.txt](doc/isa.txt) — ISA 草案
+- [doc/legacy/](doc/legacy/) — 早期 OS / 三模式统一设计稿（DEPRECATED）
 
 ## 备注
 

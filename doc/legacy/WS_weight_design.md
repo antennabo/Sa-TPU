@@ -1,3 +1,11 @@
+> ⚠ **DEPRECATED** — WS 权重双缓冲 + 切换波前推导稿。原理被
+> [../systolic_array.md](../systolic_array.md) 吸收并对齐 RTL。本文 §4 `shadow_load` 窗口、
+> §5 `w_switch[AR][AC]` per-PE mask、§6 5 态 FSM、全文 `F` 字段都与现 RTL 不一致——
+> 现版本：shadow 是 sa 内反压 FIFO（valid/ready 自握手）、`b_sw[AR]` 边缘 + sa 右推、
+> 6 态 FSM、`W = AR + LATENCY` + `tile_num`。保留为历史参考；新工作请读 doc/ 根下的新版。
+
+---
+
 # WS 数据流的权重设计（ping-pong 双缓冲 + 反对角线切换波前）
 
 本文档记录 Sa-TPU golden model 里 **WS（weight-stationary，权重驻留）** 数据流的权重处理设计，

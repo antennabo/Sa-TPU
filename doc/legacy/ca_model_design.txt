@@ -1,4 +1,9 @@
 ================================================================
+[DEPRECATED] La-TPU Cycle-Accurate Simulation Design (2026-05)
+项目早期叫 "La-TPU"，本文是当时的 cycle-accurate sim 草稿。
+当前项目为 Sa-TPU（WS-only），sim 路线见 doc/roadmap.md，模块映射见 doc/architecture.md。
+保留为历史参考。
+================================================================
 Cycle-Accurate Simulation Design
 La-TPU Project
 ================================================================

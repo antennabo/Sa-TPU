@@ -1,3 +1,10 @@
+> ⚠ **DEPRECATED** — 早期 OS/WS/IS 三模式统一设计稿。当前主线已切到 WS-only 落地，
+> 本文 OS / IS 部分不再维护，WS 部分被 [../systolic_array.md](../systolic_array.md) 吸收并对齐 RTL。
+> 字段命名 / 接口几何与现 RTL 不一致（如 `output_sel`、`acc_clr`、`Gk ≥ M+N-1`、`is_b_buf`）。
+> 保留为历史参考；新工作请读 doc/ 根下的新版。
+
+---
+
 # spatial_array 阵列设计（OS/WS/IS 三模式统一路由）
 
 本文档是 Sa-TPU golden model 里 **脉动阵列 `spatial_array`（简称 sa）** 的总设计说明。

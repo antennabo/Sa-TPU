@@ -1,14 +1,15 @@
-# RISC-V Core + TPU 计划 (v0.4)
+# RISC-V Core + TPU 路线图
 
 **平台**：AU15P (Zynq UltraScale+) · 纯片上起步 · 端到端跑通 MNIST 级小 CNN
 **核**：自研 RV32IM 3 级 in-order + cooperative RTOS（控制器）
-**TPU**：16×16 INT8 脉动阵列（性能主体）
+**TPU**：8×8 INT8 WS 脉动阵列（v0：当前；v1 计划扩到 16×16）
 
 **量化前提**：输入模型**已离线 INT8 量化**（per-tensor / 整层一个 scale）。量化本身不在工作范围，
 工作是"忠实地用定点硬件执行它"。当前缺口：浮点 scale 还没定点化（见 §1.2 / 步 1）。
 
-**当前位置**：软件 golden — 线性层 tile 已切、OS 多 tile + WS 单 tile 逐拍验证通过；
-conv / 激活 / 跨层 / 定点化未做。
+**当前位置**：WS-only 主线（OS 路径已搁置，见 [decisions.md](decisions.md) D1）。
+RTL `controller_ws + sa + abuf + wfifo + accumulator` 顶层整合完成 + ctrl_ws_tb / tpu_top_tb
+逐拍对拍跑通；conv / 激活 / 跨层 / 定点化未做。
 
 图例：✅ 已完成 · 🔧 进行中 · ⏳ 未开始 · ⚠️ 风险/关键
 
@@ -51,12 +52,12 @@ RTOS 运行成功、DSP 乘法器（1 拍延迟）。
 跨线接口必须有单一权威定义，三条线都引用它，不各自实现。
 
 1. **layout 规范**：权重/激活在 BRAM/DRAM 怎么摆，阵列灌权重顺序。
-   （现状散在 backend tiling + `WS_weight_design.md` §11，待收成单一文档）
+   （现状散在 `compiler/` tiling + [systolic_array.md](systolic_array.md) §5；待整合到 ISA 落定时一并冻结）
 2. **ISA 规范**：指令编码 + 语义。**地址字段预留 DRAM 宽度（32 位）**，步 3 加 DRAM 不用改 ISA。
-   （现状 `analyzer/instr.py`，待定稿冻结）
+   （现状 [isa.txt](isa.txt) 草案 + `compiler/instr.py`，待定稿冻结）
 3. **时序约定规范**：握手拍数语义（start/done 在第几拍）、各模块固定延迟、流水级数。
    Python 和 RTL 都照这份，否则会 debug 大量"其实只是约定不同"的假 bug。
-   （现状 `WS_weight_design.md` 记了 OS/WS 时序，待提炼成规范）
+   （现状 [controller_ws.md](controller_ws.md) §7 + [architecture.md](architecture.md) §5，待持续维护）
 
 ## 3. 五步演进（每步一个明确瓶颈，不提前）
 
@@ -93,13 +94,13 @@ RTOS 运行成功、DSP 乘法器（1 拍延迟）。
 
 ### 步 1a · cycle 模型线
 
-**目标**：对整体tpu框架有一个基本建模，主要包括weight fifo，activation buffer，systolic array，accumulator等等。目标是能计算一层网络（layer3）
-**产出 = 计算阵列固化**：spatial_array + pe（OS/WS 都对）定型，之后一直复用、尽量不改。
+**目标**：对整体 TPU 框架有基本建模——weight_fifo / activation_buf / systolic_array / accumulator
++ controller_ws，能计算 SimpleCNN 的单层（验证范围见 [scope.md](scope.md) §8）。
+**产出 = 计算阵列固化**：systolic_array + pe 定型（WS-only，见 [decisions.md](decisions.md) D1），
+之后一直复用、尽量不改。
 
-- **Python · 逐拍**（B，单 tile）：B1 OS / B4 WS-1 / B6 K 切段累加 / B7 K 不整除补零 均已通 ✅。
-  当前卡 **B8 导出对拍向量**：layer2/3 激活全零 → 导出 C 平凡为零，根因疑 backend 激活未传播
-  （连带 cycle_analyzer numeric_ok 平凡通过）。排查方案见 [compiler_model_split.md](compiler_model_split.md)。
-
+- **Python · 逐拍**（B，单 tile）：B1 OS / B4 WS-1 / B6 K 切段累加 / B7 K 不整除补零 均已通过 ✅。
+- **下一步**：导出对拍向量给 RTL（tpu_top_tb 已搭好，需把 compiler 端的 layer2/3 激活全零 bug 修掉）。
 
 ### 步 1b · 编译器
 **任务**
@@ -108,13 +109,13 @@ RTOS 运行成功、DSP 乘法器（1 拍延迟）。
 
 ### 步 1c · rtl
 **任务**
-- 按照python模型完成rtl
-- 通过配置接口可以配置weight fifo和activation buffer，一步一步计算，可以计算一层
-- **RTL**：PE 微架构 → 16×16 阵列 → APB 寄存器/状态机 → requant 通路（单 tile 对拍）。
+- 按照 Python 模型完成 RTL ✅（[architecture.md](architecture.md) §3 五模块已落地、tinytpu_top 整合完成）
+- 通过 raw 写口（abuf/wfifo）+ controller_ws 上层握手，一步一步算一层
+- **RTL**：PE 微架构 ✅ → 8×8 阵列 ✅ → APB 寄存器/状态机 ⏳ → requant 通路 ⏳
 
 **验收条件**
-- 单层 GEMM（单 tile）：RTL 波形**逐拍 + 逐值**对齐 Python golden（WS）
-- 上板测试能正确计算单层网络
+- 单层 GEMM（单 tile）：RTL 波形**逐拍 + 逐值**对齐 Python golden（WS）✅（tpu_top_tb 已通过）
+- 上板测试能正确计算单层网络 ⏳
 
 ## 步 2 · 指令流，硬件解析（控制下放硬件）
 

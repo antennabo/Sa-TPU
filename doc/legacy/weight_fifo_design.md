@@ -1,3 +1,10 @@
+> ⚠ **DEPRECATED** — weight fifo 早期设计稿（CommonFIFO 模型）。当前 RTL
+> `rtl/weight_fifo.sv` 实现概要收进 [../controller_ws.md](../controller_ws.md) 接口表：
+> AC 个独立 lane sync_fifo + 同步广播写。读侧 valid/ready 与 sa shadow 反压链对接。
+> 保留为历史参考；新工作请读 doc/ 根下的新版。
+
+---
+
 # weight fifo 设计（CommonFIFO：按 lane 缓存权重 tile，主动推给阵列边缘）
 
 本文档写给**第一次接触本项目**的读者，自顶向下：先讲 weight fifo 要解决什么，再讲整体结构、对外接口、内部细节。

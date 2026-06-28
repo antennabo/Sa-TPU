@@ -1,3 +1,11 @@
+> ⚠ **DEPRECATED** — 早期 OS / WS 双状态机设计稿。OS 路径不再落地；WS 部分被
+> [../controller_ws.md](../controller_ws.md) 吸收并对齐到现 RTL `rtl/controller_ws.sv`。
+> 本文 WS FSM 为 5 态（IDLE/WLOAD/STREAM/STALL/DRAIN），现 RTL 已演进为 6 态
+> （IDLE/WLOAD/FEED/CAPTURE/OVERLAP/DRAIN）；`F` 已删，改为 `W = AR + LATENCY` + `tile_num`。
+> 保留为历史参考；新工作请读 doc/ 根下的新版。
+
+---
+
 # controller 设计（OS / WS 双状态机 · 把一次 tile 矩阵乘调度成逐拍信号）
 
 本文档写给**第一次接触本项目**的读者，自顶向下：先讲 controller 要解决什么问题，再讲整体结构，

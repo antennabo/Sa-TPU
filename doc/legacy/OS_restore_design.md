@@ -1,3 +1,10 @@
+> ⚠ **DEPRECATED** — OS 累加 / drain / restore 设计决策稿。OS 路径不再落地。
+> "删除 `restore_data` 接口" 的决策已浓缩进 [../decisions.md](../decisions.md)。
+> §5–6 的 `wr_tile` 标量 vs per-column、`Gk≥M+N-1` 论证已被 WS accumulator 的 per-column SR
+> 实现替代（见 [../decisions.md](../decisions.md)）。保留为历史参考；新工作请读 doc/ 根下的新版。
+
+---
+
 # OS 累加与 restore 设计（决策：不支持 gap+驱逐续算）
 
 本文档记录 Sa-TPU golden model 里 **OS（output-stationary）数据流的累加复位（restore）设计决策**，
