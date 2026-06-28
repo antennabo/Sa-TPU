@@ -2,77 +2,45 @@ from .module import module
 
 
 class CommonBuf(module):
-    """每 lane 一个可寻址缓冲（带读指针、自加、到顶归 0 复用）。喂料机制与 CommonFIFO 相同：controller
-    只给标量 feed，skew 由内部 lane 传播 _prop 生成（最左 lane 注入、逐拍右推，lane c 延 c 拍点亮，见
-    doc/common_buf_design.md §6）。与 fifo 的区别：点亮的 lane 按【读指针】取数、**不弹走**——
-    指针自加、封顶 tile_num*K 时归 0（自动复用同一份激活喂下个 N-tile）。
+    """纯被动 lane buffer（对齐 rtl/activation_buf.sv）：N 个 lane，每 lane 一条 list（深度 DEPTH）。
 
-    地址 {page, tile_id, row}：page=ping-pong 双缓冲页（switch_page 占位，后续指令解析驱动）；
-    一个线性自加指针同时表 {tile_id, row}（addr // K = tile_id，addr % K = row），封顶 = tile_num*K。
+    模块内无控制状态，地址完全外部驱动。
+    写口、读口都是 per-lane (en, addr, data)，跟 RTL activation_buf 一一对应。
+    输出 data/vld 寄存 1 拍：本拍 update 触发的读 → commit 后 data/vld 反映出来（1 个 FF 延迟，
+    对齐 sdpram REG_OUT=0 + rd_vld FF）。
 
-    输出寄存 1 拍：data/vld 是 sdpram REG_OUT=0 + rd_vld FF 的行为镜像——本拍 update 计算出的
-    读结果在【本拍 commit 后】就在 data/vld 上可见（1 个 FF 延迟），跟 RTL activation_buf 对齐。
-
-    update(wdata, feed, tile_num=1):
-      wdata    -- DMA 本拍写入的一条深度向量 [N]（None/False 则不写）；写当前 page，存住不消费
-      feed     -- 标量：这拍喂不喂。内部 _prop：lane c 在 feed 之后第 c 拍点亮、否则出 0
-      tile_num -- 当前 page 内 tile 数；读指针封顶 = tile_num*K（到顶归 0）
-    data       -- list[N] 各 lane 输出（上一拍读的结果，1 拍输出寄存），commit 后有效
-    vld        -- list[N] 各 lane 输出是否有效（上一拍的点亮，跟 data 同节拍）
-    switch_page() -- ping-pong 切页（占位，后续指令解析驱动）：翻活动页、读指针归 0
+    地址生成（per-lane offset 自加、start_addr 跳变重置）由外部 AbufRdAddrGen 完成；ping-pong
+    page 等"多段数据"语义也由外部通过 start_addr 表达，本模块不感知。
     """
 
-    def __init__(self, N: int, K: int):
+    def __init__(self, N, DEPTH):
         super().__init__()
-        self.N = N
-        self.K = K                                      # 每 tile 深度（行数）
+        self.N     = N
+        self.DEPTH = DEPTH
         self.reset()
 
     def reset(self):
-        self._buf       = [[[] for _ in range(self.N)] for _ in range(2)]  # 2 页 ping-pong，每 lane 一条 list
-        self._page      = 0                             # 当前活动页（读/写同页；真 ping-pong 由指令切页后续接）
+        self._mem       = [[0] * self.DEPTH for _ in range(self.N)]
         self.data       = [0] * self.N
-        self.data_next  = [0] * self.N
         self.vld        = [False] * self.N
-        self._rd        = [False] * self.N              # 本拍点亮的 lane（update 暂存，commit 用）
-        self._prop      = [False] * self.N              # lane 方向传播 SR：最左注入、逐拍右推 → skew
-        self._prop_next = [False] * self.N
-        self._ptr       = [0] * self.N                  # 每 lane 读指针（点亮时取数 + 自加，封顶归 0）
-        self._ptr_next  = [0] * self.N
+        self._data_next = [0] * self.N
+        self._vld_next  = [False] * self.N
 
-    def update(self, wdata, feed, tile_num: int = 1):
-        # --- 写入（DMA）：一条深度向量 / 拍，存住当前页（不消费）---
-        if wdata is not None and wdata is not False:
-            for c in range(self.N):
-                self._buf[self._page][c].append(wdata[c])
-
-        # --- 读出（到阵列），两段式 ---
-        # 标量 feed → 内部 lane 传播生成 skew：最左 lane 注入、逐拍右推，lane c 延 c 拍点亮
-        self._prop_next = [bool(feed)] + self._prop[:-1]
-        rd = self._prop_next
-        self._rd = list(rd)
-        cap = tile_num * self.K                          # 读指针封顶 = tile_num*K（到顶归 0 复用）
-        page = self._page
-        dn = [0] * self.N
-        ptr_next = list(self._ptr)
+    def update(self, wr_en, wr_addr, wr_data, rd_en, rd_addr):
+        # 写口：本拍 wr_en[c]==True 即写 _mem[c][wr_addr[c]] = wr_data[c]
         for c in range(self.N):
-            if rd[c]:                                    # 点亮：读指针处取数（不弹走），指针自加、封顶归 0
-                if self._ptr[c] < len(self._buf[page][c]):
-                    dn[c] = self._buf[page][c][self._ptr[c]]
-                ptr_next[c] = (self._ptr[c] + 1) % cap
-        self.data_next = dn
-        self._ptr_next = ptr_next
+            if wr_en[c]:
+                self._mem[c][int(wr_addr[c])] = wr_data[c]
+        # 读口：本拍 rd_en[c]==True → 下拍 commit 后 data[c]/vld[c] 反映读出
+        data_next = [0] * self.N
+        vld_next  = [False] * self.N
+        for c in range(self.N):
+            if rd_en[c]:
+                data_next[c] = self._mem[c][int(rd_addr[c])]
+                vld_next[c]  = True
+        self._data_next = data_next
+        self._vld_next  = vld_next
 
     def commit(self):
-        # 1 拍输出寄存：本拍 update 算出来的 data_next/_rd 在 commit 后立即变成可见 data/vld
-        # （sdpram REG_OUT=0 + rd_vld FF：1 个 FF 延迟，跟 RTL activation_buf 对齐）
-        self.data  = list(self.data_next)
-        self.vld   = list(self._rd)
-        self._ptr  = self._ptr_next
-        self._prop = self._prop_next
-
-    def switch_page(self):
-        # ping-pong 切页（占位，后续指令解析驱动）：翻活动页、读指针归 0
-        self._page ^= 1
-        self._ptr      = [0] * self.N
-        self._ptr_next = [0] * self.N
+        self.data = list(self._data_next)
+        self.vld  = list(self._vld_next)

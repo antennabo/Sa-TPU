@@ -2,85 +2,64 @@ from simulator.cycle.sim_model.commonbuf import CommonBuf
 
 
 class TestCommonBuf:
-    """CommonBuf：写口存当前页、标量 feed → 内部 lane 传播生成 skew（同 fifo）、读指针自加、
-    封顶 tile_num*K 归 0 复用、ping-pong 切页。见 doc/common_buf_design.md。
+    """CommonBuf：纯被动 lane buffer，外部驱动 (wr_en, wr_addr, wr_data, rd_en, rd_addr)。
+    读出 data/vld 寄存 1 拍：本拍 update 读 → 当拍 commit 后即出。"""
 
-    输出寄存 1 拍（对齐 RTL activation_buf：sdpram REG_OUT=0 + rd_vld FF）：
-      第 t 拍 update 触发的读 → 第 t 拍 commit 后 data/vld 立即反映出来（1 个 FF）。
-    """
-
-    def tick(self, b, wdata, feed, tile_num=1):
-        b.update(wdata, feed, tile_num)
+    def tick(self, b, wr_en, wr_addr, wr_data, rd_en, rd_addr):
+        b.update(wr_en, wr_addr, wr_data, rd_en, rd_addr)
         b.commit()
 
-    def preload(self, b, tile):
-        """tile = K 条深度向量 [K][N]；逐拍写入（feed=False，不读）。"""
-        for vec in tile:
-            self.tick(b, vec, False)
+    def test_write_then_read_back(self):
+        b = CommonBuf(N=2, DEPTH=4)
+        N = b.N
+        # 先写：lane0 addr=1 写 100，lane1 addr=2 写 200
+        self.tick(b,
+                  wr_en=[True, True], wr_addr=[1, 2], wr_data=[100, 200],
+                  rd_en=[False] * N, rd_addr=[0] * N)
+        # 再读
+        self.tick(b,
+                  wr_en=[False] * N, wr_addr=[0] * N, wr_data=[0] * N,
+                  rd_en=[True, True], rd_addr=[1, 2])
+        assert b.data == [100, 200]
+        assert b.vld  == [True, True]
 
-    def test_scalar_feed_generates_skew(self):
-        # 与 CommonFIFO 同款 skew：lane c 延 c 拍点亮；1 拍输出寄存 → data 当拍 commit 就出
-        b = CommonBuf(N=3, K=3)
-        tile = [[0 + d, 10 + d, 20 + d] for d in range(3)]   # [K][N]
-        self.preload(b, tile)
-        outs = []
-        for _ in range(b.K + b.N):
-            self.tick(b, None, True)
-            outs.append(list(b.data))
-        # lane0：触发 t=0..2 读 0,1,2 → outs[0..2]
-        assert outs[0][0] == 0 and outs[1][0] == 1 and outs[2][0] == 2
-        # lane1：延 1 拍 → outs[1..3]
-        assert outs[0][1] == 0
-        assert outs[1][1] == 10 and outs[2][1] == 11 and outs[3][1] == 12
-        # lane2：延 2 拍 → outs[2..4]
-        assert outs[0][2] == 0 and outs[1][2] == 0
-        assert outs[2][2] == 20 and outs[3][2] == 21 and outs[4][2] == 22
-
-    def test_feed_low_outputs_zero(self):
-        b = CommonBuf(N=2, K=2)
-        self.preload(b, [[1, 2], [3, 4]])
-        self.tick(b, None, False)             # feed=False → 全 0、不读
+    def test_rd_en_low_outputs_zero_and_invalid(self):
+        b = CommonBuf(N=2, DEPTH=2)
+        N = b.N
+        self.tick(b, [True, True], [0, 0], [9, 9], [False] * N, [0] * N)
+        # rd_en 全 0：data/vld 都该是 0/False
+        self.tick(b, [False] * N, [0] * N, [0] * N, [False, False], [0, 0])
         assert b.data == [0, 0]
-        self.tick(b, None, True)              # 触发 lane0 读 → 当拍 commit 后即出
-        assert b.data[0] == 1
+        assert b.vld  == [False, False]
 
-    def test_pointer_wraps_at_tile_num_K(self):
-        # 单 tile（tile_num=1, K=2）：lane0 连读，指针自加到 2 归 0 → 重读同一份（自动复用）
-        b = CommonBuf(N=1, K=2)
-        self.preload(b, [[5], [6]])           # _buf[page][0] = [5, 6]
+    def test_lanes_are_independent(self):
+        b = CommonBuf(N=3, DEPTH=4)
+        N = b.N
+        # 写：lane0 addr=0=10、lane1 addr=1=11、lane2 addr=2=12
+        self.tick(b,
+                  wr_en=[True] * N, wr_addr=[0, 1, 2], wr_data=[10, 11, 12],
+                  rd_en=[False] * N, rd_addr=[0] * N)
+        # 只读 lane1
+        self.tick(b,
+                  wr_en=[False] * N, wr_addr=[0] * N, wr_data=[0] * N,
+                  rd_en=[False, True, False], rd_addr=[0, 1, 0])
+        assert b.vld == [False, True, False]
+        assert b.data[1] == 11
+
+    def test_overwrite_same_address(self):
+        b = CommonBuf(N=1, DEPTH=2)
+        self.tick(b, [True], [0], [7], [False], [0])
+        self.tick(b, [True], [0], [99], [False], [0])      # 覆写
+        self.tick(b, [False], [0], [0], [True], [0])
+        assert b.data == [99]
+
+    def test_two_writes_then_read_alternating(self):
+        b = CommonBuf(N=1, DEPTH=4)
+        # 写入 addr 0..3 = 0,10,20,30，逐拍
+        for a, v in [(0, 0), (1, 10), (2, 20), (3, 30)]:
+            self.tick(b, [True], [a], [v], [False], [0])
         seen = []
-        for _ in range(5):                    # 读 5 拍
-            self.tick(b, None, True, tile_num=1)
+        for a in [3, 1, 2, 0]:                              # 任意顺序读
+            self.tick(b, [False], [0], [0], [True], [a])
             seen.append(b.data[0])
-        assert seen == [5, 6, 5, 6, 5]
-        assert b._ptr[0] == 1                 # 5 拍后指针回到 1（0→1→0→1→0→1）
-
-    def test_tile_num_two_spans_both_tiles(self):
-        # tile_num=2, K=2：封顶 4，指针扫两个 tile 的全部行再归 0
-        b = CommonBuf(N=1, K=2)
-        self.preload(b, [[10], [11], [20], [21]])   # 两个 tile：[10,11] | [20,21]
-        seen = []
-        for _ in range(6):
-            self.tick(b, None, True, tile_num=2)
-            seen.append(b.data[0])
-        assert seen == [10, 11, 20, 21, 10, 11]
-
-    def test_switch_page_isolates_data(self):
-        # ping-pong：page0 写一份、切页 page1 写另一份；切回 page0 数据仍在（双缓冲隔离）
-        b = CommonBuf(N=1, K=1)
-        self.tick(b, [100], False)            # page0 存 100
-        b.switch_page()
-        self.tick(b, [200], False)            # page1 存 200
-        self.tick(b, None, True, tile_num=1)  # 触发读 page1，当拍 commit 后即出
-        assert b.data[0] == 200
-        b.switch_page()                       # 切回 page0（读指针归 0）
-        self.tick(b, None, True, tile_num=1)  # 触发读 page0
-        assert b.data[0] == 100               # page0 数据未被 page1 覆盖
-
-    def test_vld_marks_lit_lanes(self):
-        b = CommonBuf(N=2, K=1)
-        self.preload(b, [[7, 8]])
-        self.tick(b, None, True)              # 触发 lane0 读 → 当拍 commit 后即出
-        assert b.vld == [True, False] and b.data[0] == 7
-        self.tick(b, None, False)             # lane1 由 prop 右推触发；feed 关掉 prop[0]=False
-        assert b.vld == [False, True] and b.data[1] == 8
+        assert seen == [30, 10, 20, 0]

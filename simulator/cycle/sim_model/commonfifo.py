@@ -78,26 +78,31 @@ class CommonFIFO(module):
         self._started_next = self._started + (1 if (rd[0] and self._heads and self._heads[0]) else 0)
 
     def ws_update(self, wdata, ready):
-        # WS 读口：每列 valid/ready【组合握手】，整行出（无 skew，见 doc/weight_fifo_design.md §6）。
+        # WS 读口（FWFT/show-ahead）：peek 队头组合输出 → self.data/self.vld 本拍直接可见。
         #   wdata -- DMA 写入一条深度向量 [N]（None/False 不写）；预载倒序写（见 WS_weight_design §11）
-        #   ready -- list[N]：每列下游 ready（= sa 该列 shadow 未满）
-        # present[c] = lane c 非空 & ready[c]：本拍组合 peek 出队头给 sa（data/vld 即时有效），
-        # commit 同拍 pop。组合（非寄存）使弹出与 sa 载入同拍，反压即时、不超弹；swap 拍该列
-        # shadow 满 → ready=0 → 自然反压（per-column，不需全局 consume）。
+        #   ready -- list[N]：每列下游 ready（= sa 该列 shadow 能接受）
+        # rden[c] = !empty[c] & ready[c]：commit 时弹出（消费完成）。输出在 sdpram + 1 深 skid
+        # prefetch 的 RTL 模型下，等价于一直持有队头直到被消费，没有 1 拍 FF 滞后；这样 sa 看到
+        # b_vld/b_data 与 rdy 同拍握手，不会再出现"pop 完下拍才到、shadow 已满 → 数据丢"的 overshoot。
+        # 同拍 push (_write) 仍放 peek 之后：RTL 里 cy K 的 wr 在 posedge 才落到 wr_addr，cy K 的
+        # !empty 检查用的是 push 前的状态。
         self._ws = True
-        self._write(wdata)
 
-        data = [0] * self.N
-        vld  = [False] * self.N
+        # peek BEFORE write —— 组合输出当前队头
         for c in range(self.N):
-            if (not self._fifos[c].empty()) and bool(ready[c]):
+            if not self._fifos[c].empty():
                 self._fifos[c].compute()
                 v = self._fifos[c].next_state
-                data[c] = 0 if v is None else v
-                vld[c]  = True
-        self.data = data          # 组合即时输出（peek），sa 同拍读
-        self.vld  = vld
-        self._rd  = list(vld)      # present 的列 commit 时 pop
+                self.data[c] = 0 if v is None else v
+                self.vld[c]  = True
+                self._rd[c]  = bool(ready[c])   # consumer 接 → commit 时 pop
+            else:
+                self.data[c] = 0
+                self.vld[c]  = False
+                self._rd[c]  = False
+
+        # write LAST —— push 这拍落到 fifo，下拍才能被 peek 看到
+        self._write(wdata)
 
     def commit(self):
         for c in range(self.N):
@@ -110,4 +115,4 @@ class CommonFIFO(module):
                 self._heads.popleft()
             self._started = self._started_next
             self._prop = self._prop_next
-        # WS：data/vld 已在 ws_update 组合即时设，commit 只 pop（上面的 fifo.commit）
+        # WS：data/vld 已在 ws_update 直接写好（组合输出），commit 只负责 pop
