@@ -26,7 +26,7 @@ module sdpram #(
     parameter int ADDR_W    = (DEPTH <= 1) ? 1 : $clog2(DEPTH),
     parameter int BYTE_EN_W = DATA_W / 8,
     parameter INIT_FILE = "",
-    parameter bit REG_OUT = 1'b1
+    parameter bit REG_OUT = 1'b0
 )(
     input  logic                    clk,
 
@@ -73,15 +73,26 @@ always @(posedge clk) begin
     end
 end
 
+logic [DATA_W-1:0] rd_rdata_r;
+
+always_ff @(posedge clk) begin
+    if((wr_addr==rd_addr)&&wr_en)begin
+        rd_rdata_r <= wr_wdata;
+    end else begin
+        rd_rdata_r <= mem[rd_addr];
+    end
+
+end
+
 generate
     if (REG_OUT) begin : g_reg_out
+        logic [DATA_W-1:0] rd_rdata_rr;
         always_ff @(posedge clk) begin
-            if (rd_en) begin
-                rd_rdata <= mem[rd_addr];
-            end
+            rd_rdata_rr <= rd_rdata_r;
         end
+        assign rd_rdata = rd_rdata_rr;
     end else begin : g_no_reg_out
-        assign rd_rdata = mem[rd_addr];
+        assign rd_rdata = rd_rdata_r;
     end
 endgenerate
 

@@ -49,7 +49,7 @@ end
 always_ff @(posedge clk or negedge rst_n) begin : rd_addr_ff
     if (!rst_n) begin
         rd_addr <= '0;
-    end else if (rd_real) begin
+    end else if(rd_real) begin
         rd_addr <= rd_addr + 'd1;
     end
 end
