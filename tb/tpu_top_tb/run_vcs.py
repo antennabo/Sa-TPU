@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-# 用 VCS 跑 ctrl_ws_tb（controller_ws WS 逐拍对拍）。
+# 用 VCS 跑 tpu_top_tb（tinytpu_top 端到端逐拍 cosim）。
 #
-# 用法（在 tb/ctrl_ws_tb/ 下执行）:
-#   python run_vcs.py                # 跑默认 single
-#   python run_vcs.py -t <name>      # TESTS 字典里某条 (single / switch / multi)
+# 用法（在 tb/tpu_top_tb/ 下执行）:
+#   python run_vcs.py                # 跑默认 small
 #   python run_vcs.py -fsdb          # + 出 cpu_wave.fsdb
 #   python run_vcs.py -wave          # + 跑完用 verdi 打开 fsdb
 #   python run_vcs.py -clean         # 清理 VCS 产物
 #
 # 依赖: vcs / verdi 在 PATH; VERDI_HOME 已设置;
-#       golden 向量已由对应 pytest 生成（默认 test_ctrl_ws_single_dump / test_ctrl_ws_switch_dump）。
+#       golden 向量已由 simulator/cycle/tests/tpu_top_test.py::test_tpu_top_dump_{small,switch} 生成。
 
 import os
 import shutil
@@ -22,24 +21,12 @@ SIM_LOG = "sim.log"
 FSDB = "cpu_wave.fsdb"
 
 TESTS = {
-    "single":         {"ar": 2, "ac": 2, "wtnm": 2,
-                       "txt": "../../build/ctrl_ws_cosim/single.txt",
-                       "pytest": "test_ctrl_ws_single_dump"},
-    "switch":         {"ar": 2, "ac": 2, "wtnm": 2,
-                       "txt": "../../build/ctrl_ws_cosim/switch.txt",
-                       "pytest": "test_ctrl_ws_switch_dump"},
-    "multi":          {"ar": 2, "ac": 2, "wtnm": 2,
-                       "txt": "../../build/ctrl_ws_cosim/multi.txt",
-                       "pytest": "test_ctrl_ws_multi_tile_dump"},
-    "capture_switch": {"ar": 2, "ac": 2, "wtnm": 4,
-                       "txt": "../../build/ctrl_ws_cosim/capture_switch.txt",
-                       "pytest": "test_ctrl_ws_capture_switch_dump"},
-    "rewait_early":   {"ar": 2, "ac": 2, "wtnm": 4,
-                       "txt": "../../build/ctrl_ws_cosim/rewait_early.txt",
-                       "pytest": "test_ctrl_ws_rewait_early_dump"},
-    "rewait_late":    {"ar": 2, "ac": 2, "wtnm": 4,
-                       "txt": "../../build/ctrl_ws_cosim/rewait_late.txt",
-                       "pytest": "test_ctrl_ws_rewait_late_dump"},
+    "small":  {"n": 2, "latency": 2, "wtn_max": 1, "abuf_depth": 4, "accum_depth": 32,
+               "txt": "../../build/tpu_top_cosim/small.txt",
+               "pytest": "test_tpu_top_dump_small"},
+    "switch": {"n": 2, "latency": 2, "wtn_max": 2, "abuf_depth": 8, "accum_depth": 32,
+               "txt": "../../build/tpu_top_cosim/switch.txt",
+               "pytest": "test_tpu_top_dump_switch"},
 }
 
 CLEAN_TARGETS = [
@@ -62,9 +49,11 @@ def compile_vcs(test: dict, dump_fsdb: bool) -> int:
     cmd = [
         "vcs", "-sverilog", "-full64",
         "-timescale=1ns/1ps",
-        f"+define+CTRL_AR={test['ar']}",
-        f"+define+CTRL_AC={test['ac']}",
-        f"+define+CTRL_WTILE_NUM_MAX={test['wtnm']}",
+        f"+define+TPU_TOP_N={test['n']}",
+        f"+define+TPU_TOP_LATENCY={test['latency']}",
+        f"+define+TPU_TOP_WTILE_NUM_MAX={test['wtn_max']}",
+        f"+define+TPU_TOP_ABUF_DEPTH={test['abuf_depth']}",
+        f"+define+TPU_TOP_ACCUM_DEPTH={test['accum_depth']}",
         "-f", "filelist_tb.f",
         "-o", SIMV,
         "-l", COMPILE_LOG,
@@ -104,7 +93,7 @@ def verdict(stdout: str) -> str:
 
 
 def parse_args(args):
-    t = "single"
+    t = "small"
     if "-t" in args:
         i = args.index("-t")
         if i + 1 >= len(args):
@@ -133,8 +122,9 @@ def main() -> int:
         print(f"        先在仓库根目录运行: pytest -k {test['pytest']}")
         return 1
 
-    print(f"[TEST] {test_name}  AR={test['ar']} AC={test['ac']} "
-          f"WTILE_NUM_MAX={test['wtnm']}  TXT={test['txt']}")
+    print(f"[TEST] {test_name}  N={test['n']} LATENCY={test['latency']} "
+          f"WTILE_NUM_MAX={test['wtn_max']} ABUF_DEPTH={test['abuf_depth']} "
+          f"ACCUM_DEPTH={test['accum_depth']}  TXT={test['txt']}")
 
     if compile_vcs(test, dump_fsdb) != 0:
         print(f"[ERROR] VCS 编译失败，见 {COMPILE_LOG}")

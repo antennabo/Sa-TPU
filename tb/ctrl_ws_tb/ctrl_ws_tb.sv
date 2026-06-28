@@ -3,13 +3,15 @@
 // 读 +TXT=<path> 指定的 golden 向量。
 // 文件格式（由 simulator/cycle/tests/controller_ws_test.py 生成）：
 //   - 任意行 `#` 开头 → 注释，扫到第一个非 `#` 行作头
-//   - 头行: AR AC F NCYC
-//   - 数据行：cy start wL aA sw tag tn sp  state feed b_sw[AR]  wr_row wr_tile wr_vld  rd_en[AR] rd_addr[AR]
+//   - 头行: AR AC NCYC
+//   - 数据行 (按列序)：
+//       cy start wL aA  wtn ac sa fn   state  weight_sw[AR]  act_ren[AR] act_raddr[AR]
+//                                              acc_wen[AC] acc_waddr[AC] acc_outen[AC]
 //   - row N 含义：drive[N]=cy=N TB 要驱动的输入；expect[N]=cy=N 应读到的 RTL 输出 (寄存器值)
 //                即 commit drive[N-1] 之后的状态，row 0 expect = 复位后状态
 //
-// 维度通过 +define+CTRL_AR=N +CTRL_AC=N +CTRL_F=N +CTRL_TILE_NUM_MAX=N 配置（默认 2/2/2/2）。
-// K_ABUF 跟 controller_ws.sv 默认绑 F，LATENCY=2，TAG_W=4。
+// 维度通过 +define+CTRL_AR=N +CTRL_AC=N +CTRL_WTILE_NUM_MAX=N 配置（默认 2/2/4）。
+// LATENCY=2，ACT_ADDR_W=4，ACC_ADDR_W=6（与 Python ref dump 默认对齐）。
 
 `timescale 1ns/1ps
 `ifndef CTRL_AR
@@ -18,27 +20,26 @@
 `ifndef CTRL_AC
   `define CTRL_AC 2
 `endif
-`ifndef CTRL_F
-  `define CTRL_F 2
+`ifndef CTRL_WTILE_NUM_MAX
+  `define CTRL_WTILE_NUM_MAX 4
 `endif
-`ifndef CTRL_TILE_NUM_MAX
-  `define CTRL_TILE_NUM_MAX 2
+`ifndef CTRL_ACT_ADDR_W
+  `define CTRL_ACT_ADDR_W 4
+`endif
+`ifndef CTRL_ACC_ADDR_W
+  `define CTRL_ACC_ADDR_W 6
 `endif
 
 module ctrl_ws_tb;
-    localparam int AR           = `CTRL_AR;
-    localparam int AC           = `CTRL_AC;
-    localparam int F_MAX        = `CTRL_F;                 // 编译期最大 F（位宽用）
-    localparam int LATENCY      = 2;
-    localparam int TILE_NUM_MAX = `CTRL_TILE_NUM_MAX;
-    localparam int K_ABUF_MAX   = F_MAX;
-    localparam int TAG_W        = 4;
-    localparam int WR_TILE_W    = TAG_W;
-    localparam int M_W          = $clog2(F_MAX + 1);
-    localparam int TILE_NUM_W   = $clog2(TILE_NUM_MAX + 1);
-    localparam int PAGE_SPAN    = K_ABUF_MAX * TILE_NUM_MAX;
-    localparam int ABUF_DEPTH   = 2 * PAGE_SPAN;
-    localparam int LANE_ADDR_W  = $clog2(ABUF_DEPTH);
+    localparam int AR            = `CTRL_AR;
+    localparam int AC            = `CTRL_AC;
+    localparam int LATENCY       = 2;
+    localparam int WTILE_NUM_MAX = `CTRL_WTILE_NUM_MAX;
+    localparam int ACT_ADDR_W    = `CTRL_ACT_ADDR_W;
+    localparam int ACC_ADDR_W    = `CTRL_ACC_ADDR_W;
+    localparam int W             = AR + LATENCY;
+    localparam int FEED_NUM_W    = ACT_ADDR_W + 1;
+    localparam int WTILE_NUM_W   = (WTILE_NUM_MAX > 1) ? $clog2(WTILE_NUM_MAX + 1) : 1;
 
     logic clk, rst_n;
 
@@ -46,55 +47,63 @@ module ctrl_ws_tb;
     logic                       i_start;
     logic                       i_weight_loaded;
     logic                       i_activ_available;
-    logic                       i_switch_weight;
-    logic [TAG_W-1:0]           i_tag;
-    logic [TILE_NUM_W-1:0]      i_tile_num;
-    logic                       i_switch_page;
-    logic [M_W-1:0]             i_F;                  // 当前作业 M 维（运行时）
+    logic [WTILE_NUM_W-1:0]     i_wtile_num;
+    logic [ACT_ADDR_W-1:0]      i_act_staddr;
+    logic [ACC_ADDR_W-1:0]      i_acc_staddr;
+    logic [FEED_NUM_W-1:0]      i_feed_num;
 
     // DUT 输出
-    logic                       o_feed;
-    logic                       o_b_sw         [AR];
-    logic [M_W-1:0]             o_wr_row;
-    logic [WR_TILE_W-1:0]       o_wr_tile;
-    logic                       o_wr_vld;
-    logic                       o_rd_en        [AR];
-    logic [LANE_ADDR_W-1:0]     o_rd_addr      [AR];
+    logic                       o_weight_sw   [AR];
+    logic                       o_acc_wen     [AC];
+    logic [ACC_ADDR_W-1:0]      o_acc_waddr   [AC];
+    logic                       o_acc_accen   [AC];
+    logic                       o_acc_outen   [AC];
+    logic                       o_acc_ren     [AC];
+    logic [ACC_ADDR_W-1:0]      o_acc_raddr   [AC];
+    logic                       o_act_ren     [AR];
+    logic [ACT_ADDR_W-1:0]      o_act_raddr   [AR];
     logic [2:0]                 o_ws_state;
 
     controller_ws #(
-        .AR(AR), .AC(AC), .LATENCY(LATENCY),
-        .TILE_NUM_MAX(TILE_NUM_MAX), .K_ABUF_MAX(K_ABUF_MAX), .F_MAX(F_MAX),
-        .TAG_W(TAG_W)
+        .AR             (AR),
+        .AC             (AC),
+        .LATENCY        (LATENCY),
+        .WTILE_NUM_MAX  (WTILE_NUM_MAX),
+        .ACT_ADDR_W     (ACT_ADDR_W),
+        .ACC_ADDR_W     (ACC_ADDR_W)
     ) dut (
         .clk(clk), .rst_n(rst_n),
-        .i_start(i_start),
-        .i_weight_loaded(i_weight_loaded),
-        .i_activ_available(i_activ_available),
-        .i_switch_weight(i_switch_weight),
-        .i_tag(i_tag),
-        .i_tile_num(i_tile_num),
-        .i_switch_page(i_switch_page),
-        .i_F(i_F),
-        .o_feed(o_feed),
-        .o_b_sw(o_b_sw),
-        .o_wr_row(o_wr_row),
-        .o_wr_tile(o_wr_tile),
-        .o_wr_vld(o_wr_vld),
-        .o_rd_en(o_rd_en), .o_rd_addr(o_rd_addr),
-        .o_ws_state(o_ws_state)
+        .i_start            (i_start),
+        .i_weight_loaded    (i_weight_loaded),
+        .i_activ_available  (i_activ_available),
+        .i_wtile_num        (i_wtile_num),
+        .i_act_staddr       (i_act_staddr),
+        .i_acc_staddr       (i_acc_staddr),
+        .i_feed_num         (i_feed_num),
+        .o_weight_sw        (o_weight_sw),
+        .o_acc_wen          (o_acc_wen),
+        .o_acc_waddr        (o_acc_waddr),
+        .o_acc_accen        (o_acc_accen),
+        .o_acc_outen        (o_acc_outen),
+        .o_acc_ren          (o_acc_ren),
+        .o_acc_raddr        (o_acc_raddr),
+        .o_act_ren          (o_act_ren),
+        .o_act_raddr        (o_act_raddr),
+        .o_ws_state         (o_ws_state)
     );
 
     initial clk = 1'b0;
     always #5 clk = ~clk;
 
     integer fd, code, t, i, tmp;
-    integer ar_param, ac_param, f_param, ncyc, errors;
-    integer exp_state, exp_feed;
-    integer exp_b_sw    [AR];
-    integer exp_wr_row, exp_wr_tile, exp_wr_vld;
-    integer exp_rd_en   [AR];
-    integer exp_rd_addr [AR];
+    integer ar_param, ac_param, ncyc, errors;
+    integer exp_state;
+    integer exp_weight_sw [AR];
+    integer exp_act_ren   [AR];
+    integer exp_act_raddr [AR];
+    integer exp_acc_wen   [AC];
+    integer exp_acc_waddr [AC];
+    integer exp_acc_outen [AC];
     string  txt_path;
     string  line;
     int     idx, rc;
@@ -113,7 +122,7 @@ module ctrl_ws_tb;
             $finish;
         end
 
-        // 跳过 # 注释/空行扫到 "AR AC F NCYC" 头
+        // 跳过 # 注释/空行扫到 "AR AC NCYC" 头
         rc = 0;
         while (!$feof(fd)) begin
             void'($fgets(line, fd));
@@ -121,16 +130,16 @@ module ctrl_ws_tb;
             while (idx < line.len() && (line[idx] == " " || line[idx] == "\t")) idx = idx + 1;
             if (idx >= line.len()) continue;
             if (line[idx] == "#" || line[idx] == "\n" || line[idx] == "\r") continue;
-            rc = $sscanf(line, "%d %d %d %d", ar_param, ac_param, f_param, ncyc);
-            if (rc == 4) break;
+            rc = $sscanf(line, "%d %d %d", ar_param, ac_param, ncyc);
+            if (rc == 3) break;
         end
-        if (rc != 4) begin
-            $display("FATAL: 未找到头部 'AR AC F NCYC' (file=%s)", txt_path);
+        if (rc != 3) begin
+            $display("FATAL: 未找到头部 'AR AC NCYC' (file=%s)", txt_path);
             $finish;
         end
-        if (ar_param != AR || ac_param != AC || f_param > F_MAX) begin
-            $display("FATAL: 维度不匹配 文件 AR=%0d AC=%0d F=%0d，tb AR=%0d AC=%0d F_MAX=%0d",
-                     ar_param, ac_param, f_param, AR, AC, F_MAX);
+        if (ar_param != AR || ac_param != AC) begin
+            $display("FATAL: 维度不匹配 文件 AR=%0d AC=%0d，tb AR=%0d AC=%0d",
+                     ar_param, ac_param, AR, AC);
             $finish;
         end
 
@@ -139,71 +148,63 @@ module ctrl_ws_tb;
         i_start            = 1'b0;
         i_weight_loaded    = 1'b0;
         i_activ_available  = 1'b0;
-        i_switch_weight    = 1'b0;
-        i_tag              = '0;
-        i_tile_num         = '0;
-        i_switch_page      = 1'b0;
-        i_F                = f_param[M_W-1:0];        // 整段固定（运行时输入，scenario 期常数）
+        i_wtile_num        = '0;
+        i_act_staddr       = '0;
+        i_acc_staddr       = '0;
+        i_feed_num         = '0;
         repeat (3) @(posedge clk);
         @(negedge clk); rst_n = 1'b1;
 
         for (t = 0; t < ncyc; t = t + 1) begin
             @(negedge clk);
-            // 读 row t
-            code = $fscanf(fd, "%d", tmp);                                    // cy 索引（丢弃）
+            // 读 row t (列顺序与 dump 严格一致)
+            code = $fscanf(fd, "%d", tmp);                                       // cy 索引（丢弃）
             code = $fscanf(fd, "%d", tmp); i_start            = tmp[0];
             code = $fscanf(fd, "%d", tmp); i_weight_loaded    = tmp[0];
             code = $fscanf(fd, "%d", tmp); i_activ_available  = tmp[0];
-            code = $fscanf(fd, "%d", tmp); i_switch_weight    = tmp[0];
-            code = $fscanf(fd, "%d", tmp); i_tag              = tmp[TAG_W-1:0];
-            code = $fscanf(fd, "%d", tmp); i_tile_num         = tmp[TILE_NUM_W-1:0];
-            code = $fscanf(fd, "%d", tmp); i_switch_page      = tmp[0];
+            code = $fscanf(fd, "%d", tmp); i_wtile_num        = tmp[WTILE_NUM_W-1:0];
+            code = $fscanf(fd, "%d", tmp); i_acc_staddr       = tmp[ACC_ADDR_W-1:0];
+            code = $fscanf(fd, "%d", tmp); i_act_staddr       = tmp[ACT_ADDR_W-1:0];
+            code = $fscanf(fd, "%d", tmp); i_feed_num         = tmp[FEED_NUM_W-1:0];
+
             code = $fscanf(fd, "%d", exp_state);
-            code = $fscanf(fd, "%d", exp_feed);
-            for (i = 0; i < AR; i = i + 1) begin code = $fscanf(fd, "%d", exp_b_sw[i]);    end
-            code = $fscanf(fd, "%d", exp_wr_row);
-            code = $fscanf(fd, "%d", exp_wr_tile);
-            code = $fscanf(fd, "%d", exp_wr_vld);
-            for (i = 0; i < AR; i = i + 1) begin code = $fscanf(fd, "%d", exp_rd_en[i]);   end
-            for (i = 0; i < AR; i = i + 1) begin code = $fscanf(fd, "%d", exp_rd_addr[i]); end
+            for (i = 0; i < AR; i = i + 1) code = $fscanf(fd, "%d", exp_weight_sw[i]);
+            for (i = 0; i < AR; i = i + 1) code = $fscanf(fd, "%d", exp_act_ren[i]);
+            for (i = 0; i < AR; i = i + 1) code = $fscanf(fd, "%d", exp_act_raddr[i]);
+            for (i = 0; i < AC; i = i + 1) code = $fscanf(fd, "%d", exp_acc_wen[i]);
+            for (i = 0; i < AC; i = i + 1) code = $fscanf(fd, "%d", exp_acc_waddr[i]);
+            for (i = 0; i < AC; i = i + 1) code = $fscanf(fd, "%d", exp_acc_outen[i]);
 
             // 比对 当前 (= commit drive[t-1] 后的寄存器值)
-            // 顺序：先比第一个 mismatch 就 +errors 并继续，方便一次看清所有差异
             if (o_ws_state !== exp_state[2:0]) begin
                 $display("MISMATCH cy=%0d state got=%0d exp=%0d", t, o_ws_state, exp_state);
                 errors = errors + 1;
             end
-            if (o_feed !== exp_feed[0]) begin
-                $display("MISMATCH cy=%0d feed got=%0d exp=%0d", t, o_feed, exp_feed);
-                errors = errors + 1;
-            end
             for (i = 0; i < AR; i = i + 1) begin
-                if (o_b_sw[i] !== exp_b_sw[i][0]) begin
-                    $display("MISMATCH cy=%0d b_sw[%0d] got=%0d exp=%0d", t, i, o_b_sw[i], exp_b_sw[i]);
+                if (o_weight_sw[i] !== exp_weight_sw[i][0]) begin
+                    $display("MISMATCH cy=%0d weight_sw[%0d] got=%0d exp=%0d", t, i, o_weight_sw[i], exp_weight_sw[i]);
+                    errors = errors + 1;
+                end
+                if (o_act_ren[i] !== exp_act_ren[i][0]) begin
+                    $display("MISMATCH cy=%0d act_ren[%0d] got=%0d exp=%0d", t, i, o_act_ren[i], exp_act_ren[i]);
+                    errors = errors + 1;
+                end
+                if (o_act_raddr[i] !== exp_act_raddr[i][ACT_ADDR_W-1:0]) begin
+                    $display("MISMATCH cy=%0d act_raddr[%0d] got=%0d exp=%0d", t, i, o_act_raddr[i], exp_act_raddr[i]);
                     errors = errors + 1;
                 end
             end
-            if (o_wr_row !== exp_wr_row[M_W-1:0]) begin
-                $display("MISMATCH cy=%0d wr_row got=%0d exp=%0d", t, o_wr_row, exp_wr_row);
-                errors = errors + 1;
-            end
-            if (o_wr_tile !== exp_wr_tile[WR_TILE_W-1:0]) begin
-                $display("MISMATCH cy=%0d wr_tile got=%0d exp=%0d", t, o_wr_tile, exp_wr_tile);
-                errors = errors + 1;
-            end
-            if (o_wr_vld !== exp_wr_vld[0]) begin
-                $display("MISMATCH cy=%0d wr_vld got=%0d exp=%0d", t, o_wr_vld, exp_wr_vld);
-                errors = errors + 1;
-            end
-            for (i = 0; i < AR; i = i + 1) begin
-                if (o_rd_en[i] !== exp_rd_en[i][0]) begin
-                    $display("MISMATCH cy=%0d rd_en[%0d] got=%0d exp=%0d", t, i, o_rd_en[i], exp_rd_en[i]);
+            for (i = 0; i < AC; i = i + 1) begin
+                if (o_acc_wen[i] !== exp_acc_wen[i][0]) begin
+                    $display("MISMATCH cy=%0d acc_wen[%0d] got=%0d exp=%0d", t, i, o_acc_wen[i], exp_acc_wen[i]);
                     errors = errors + 1;
                 end
-            end
-            for (i = 0; i < AR; i = i + 1) begin
-                if (o_rd_addr[i] !== exp_rd_addr[i][LANE_ADDR_W-1:0]) begin
-                    $display("MISMATCH cy=%0d rd_addr[%0d] got=%0d exp=%0d", t, i, o_rd_addr[i], exp_rd_addr[i]);
+                if (o_acc_waddr[i] !== exp_acc_waddr[i][ACC_ADDR_W-1:0]) begin
+                    $display("MISMATCH cy=%0d acc_waddr[%0d] got=%0d exp=%0d", t, i, o_acc_waddr[i], exp_acc_waddr[i]);
+                    errors = errors + 1;
+                end
+                if (o_acc_outen[i] !== exp_acc_outen[i][0]) begin
+                    $display("MISMATCH cy=%0d acc_outen[%0d] got=%0d exp=%0d", t, i, o_acc_outen[i], exp_acc_outen[i]);
                     errors = errors + 1;
                 end
             end
