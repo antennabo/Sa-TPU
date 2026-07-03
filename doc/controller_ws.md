@@ -195,8 +195,10 @@ acc_addr_scalar= tile_acc_base + wr_row_scalar
 o_acc_wen[0]    <= wr_vld_scalar;       o_acc_wen[c]    <= o_acc_wen[c-1]
 o_acc_waddr[0]  <= acc_addr_scalar;     o_acc_waddr[c]  <= o_acc_waddr[c-1]
 o_acc_accen[*]  <= 1'b0                 # 本指令各 wtile 写独立区间, 不累加
-o_acc_outen[c]  <= o_acc_wen[c]         # outen = 最终结果 publish 信号
-                                        # 本指令 acc_en=0 各拍写入即最终, 故 outen = wen
+o_acc_outen[0]  <= wr_vld_scalar & is_last_wtile   # 仅最后一个 wtile 的写拍 publish 结果
+o_acc_outen[c]  <= o_acc_outen[c-1]                # SR 链 deskew
+                                        # is_last_wtile = (wtile_idx == i_wtile_num - 1)
+                                        # 中间 wtile 只落 acc mem, 不向下游 publish
                                         # 未来 K-tiling 指令需要区分 outen ≠ wen
 ```
 

@@ -349,7 +349,7 @@ module controller_ws #(
         end else begin
             o_acc_wen[0]   <= wr_vld_scalar;
             o_acc_waddr[0] <= acc_addr_scalar;
-            o_acc_outen[0] <= wr_vld_scalar;
+            o_acc_outen[0] <= wr_vld_scalar & is_last_wtile;
             for (int c = 1; c < AC; c = c + 1) begin
                 o_acc_wen[c]   <= o_acc_wen[c-1];
                 o_acc_waddr[c] <= o_acc_waddr[c-1];

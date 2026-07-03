@@ -1,0 +1,30 @@
+// {{MODULE_NAME}}
+//
+
+module {{MODULE_NAME}} #(
+    parameter DATA_W                = 32
+) (
+    input                           clk_sys,
+    input                           rst_n,
+
+    // ── upstream ─────────────────────────────────────────────
+    input                           i_us_valid,
+    output                          o_us_ready,
+    input  [DATA_W-1:0]             i_data,
+
+    // ── downstream ───────────────────────────────────────────
+    output                          o_ds_valid,
+    input                           i_ds_ready,
+    output [DATA_W-1:0]             o_data,
+
+    // ── control ──────────────────────────────────────────────
+    input                           i_flush
+);
+
+// ── internal signals ─────────────────────────────────────────────────────
+
+
+// ── logic ─────────────────────────────────────────────────────────────────
+
+
+endmodule

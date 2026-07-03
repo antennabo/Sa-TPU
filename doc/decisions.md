@@ -7,6 +7,106 @@
 
 ---
 
+## D10 · Requantize 契约：per-tensor symmetric qint8 (zp=0) + M0/shift/half-up 定点化（2026-07-02）
+
+**背景**：[scope.md §35](scope.md) 已定"per-tensor symmetric，zero-point = 0"作为量化契约，但
+[roadmap.md](roadmap.md) 里 `requant 通路 ⏳`、scale 定点化方案 `isa.txt §4 评估中` —— RTL 侧
+requantize 单元尚未落地。软件 golden (`simulator/functional/numerical_model.py`) 需要先把语义定死，
+RTL 按 [roadmap.md §79](roadmap.md#79) "软件 golden 阶段定死规则，RTL 严格照搬"照做。
+同时验证发现 torch 的 quantized Linear (`fbgemm` / `qnnpack`) 只支持 quint8 activation，
+**无法直接产出 zp=0 的 signed int8**，`convert_fx` 路径与 SaTPU 契约不兼容。
+
+**决策**：
+
+- **量化方案**：activation 与 weight 均 `dtype=qint8` + `qscheme=per_tensor_symmetric`，
+  zero_point = 0 恒定；不引入 per-channel、不引入 asymmetric zp。
+- **Scale 定点化**：每层 `M_float = scale_x * scale_w / scale_y` 拆成 `(M0, shift)`：
+  - M0 归一到 `[2^30, 2^31)`（int32，符号总为正），保证 ~31 bit 有效精度
+  - shift ≥ 1（`M_float < 1`，即 MAC 输出量级大于 int8 输出量级）
+  - `M_float ≥ 1` 情形 **v1 不支持**（软件 assert；场景不出现，未来出现再补左移分支）
+- **Requant 运算**（RTL 契约）：
+  ```
+  prod    (int64) = y_int32 * M0            ← 32×32→64 bit signed 乘法器
+  rounded (int64) = prod + 2^(shift-1)      ← "half-up" 加半
+  y_int8  (int8)  = clip(rounded >> shift, -128, 127)  ← 算术右移 + 饱和
+  ```
+  - **舍入**：half-up（加半后算术右移），**不是** TFLite `SaturatingRoundingDoublingHighMul`
+    的 banker's rounding —— 硬件更简单，与 fp32 参考差异 ≤ 1 LSB
+  - Clip 域固定 `[-128, 127]`（zp=0 一次定死）
+- **Bias**：`bias_int32 = round(bias_fp32 / (scale_x * scale_w))`，与 accumulator 输出直接
+  int32 饱和相加（复用 `_sat_add_i32`），**在 requant 之前**
+- **软件 golden 生成 flow**：绕开 `torch.ao.quantization.convert_fx`（其量化路径与本契约不兼容），
+  改用 fp32 forward + pre-hook 抓 activation + `max_abs / 127` 手算 scale。calibration 通过
+  fp32 遍历 DataLoader 累计 `a_max` / `y_max` 得稳定 scale
+
+**影响**：
+
+- `simulator/functional/numerical_model.py::compute_multiplier_shift` + `requantize_int32_to_int8`
+  是权威实现，含单测覆盖归一化范围 / 正负饱和 / half-up 舍入 / 与 fp32 参考 ≤ 1 LSB 差异（22/22）
+- `simulator/functional/tb_stimulus.py::dump_linear_layer` 走完整 pipeline
+  (fp32 model → int8 A/B → matmul → +bias → requant → int8)，产 `A / B / bias / Y_int32 / Y_int8 / params` 六个 txt
+- `scripts/gen_linear_golden.py` 手动 driver，产物在 `build/satpu_top_cosim/<layer>/`
+- **RTL 待跟进**：新增 requant 单元时严格按上式实现；输入位宽 32×32，shift 支持 30..40 段即可
+  （典型 M_float ~ 10^-3，shift ≈ 39）
+- [scope.md §156](scope.md) "Scale 处理" 从"评估中"转"契约已定"；[roadmap.md §114](roadmap.md)
+  的 `requant 通路 ⏳` 后续标注可改为"契约已定，RTL 待实施"
+- 本 D 项解锁"留位"里的"量化 scale 定点化方案"
+
+**替代**：
+
+- **直接 fp32 `y * M`**：拒绝 —— RTL 定点约束，golden 不能给硬件契约留想象空间
+- **TFLite banker's rounding**（`SaturatingRoundingDoublingHighMul` + `RoundingDivideByPOT`）：
+  拒绝 —— 硬件比 half-up 复杂一档，且分类任务上 1 LSB 差异不影响 argmax
+- **复用 torch quantized Linear**（fbgemm / qnnpack）：拒绝 —— activation 只支持 quint8，
+  无法给 zp=0 signed int8，直接违反 [scope.md §35](scope.md) 契约
+- **Per-channel weight scale**：拒绝 —— per-tensor 已够精度，[scope.md §157](scope.md) 已定
+- **支持 `M_float ≥ 1` 左移分支**：拒绝（v1）—— 场景不出现，YAGNI
+
+---
+
+## D9 · 顶层接口收敛到 SAB (Simple Access Bus)；新增 satpu_cfg 吸收所有 raw 端口（2026-06-28）
+
+> **2026-06-29 命名修正**：总线名 `SCB` → `SAB` = Simple Access Bus。纯改名，无语义/位宽变化；本条文与 satpu_top.sv / satpu_cfg.sv / satpu_cfg.md / gen_cfg.py 同步更新。
+
+**背景**：D8 后 `satpu_top` 对外仍散着 7 组 raw 端口（指令 4 字段 + abuf 写 / wfifo 写 / accum 读 +
+状态），要往 APB 路径接还得再加层胶水。同时 [gen_cfg.py](../rtl/cfg/script/gen_cfg.py) 的 RAM
+sel 分支两路字符串相同（占位 bug），multi-bit `alen` 实际不工作，只 uart `TX_DATA/RX_DATA`
+那种"伪 RAM"勉强能跑。
+
+**决策**：`satpu_top` 对外只剩 `clk` / `rst_n` / SAB 8 线; 内部例化 `satpu_cfg`
+（[rtl/cfg/satpu_cfg.yaml](../rtl/cfg/satpu_cfg.yaml) 生成）吸收：
+
+- 控制字段 4 个 + START / ACTIV_AVAIL + STATUS（`{wfifo_full, ws_state}` 4 bit）
+- WFIFO 段 alen=3 dlen=8（addr[2:0]=col）
+- ABUF 段 alen=13 dlen=8（addr[10:8]=row, [7:0]=byte; 高位预留）
+- ACCUM 段 alen=13 dlen=32（addr[12:10]=col, [9:0]=acc 行）
+
+`ADDR_W=15`（两段 13-bit 段 + 控制区 = 段选位 2 bit）。
+
+`gen_cfg.py` 三档 `alen` 语义补齐：`alen==0` 单槽不出 `{name}_addr`；`0<alen<ADDR_W` 前缀比较；
+`alen==ADDR_W` 占满。加段基址对齐校验。
+
+**START 边沿检测放在顶层** — `satpu_cfg` 出电平 RW，顶层 1 FF 取上升沿出 1 拍 `i_start`。
+generator **不引入** `WO_PULSE` 类型，保持 generator 通用语义干净。
+
+**影响**：
+- `rtl/satpu_top.sv` 端口面 ~7 组 → 1 组 SAB；内部加 abuf/wfifo demux、accum mux、START 边沿、STATUS 拼接
+- `rtl/cfg/script/gen_cfg.py` RAM sel 三档 + 端口生成对 `alen=0` 跳过 addr 端口 + 对齐校验
+- `rtl/cfg/satpu_cfg.yaml` 新建；`rtl/satpu_cfg.sv` 生成产物
+- **`rtl/accumulator.sv` sdpram REG_OUT 必须设 0**（组合读），否则 `o_rd_data` 1 拍延迟跟 cfg
+  RAM_RO 读时序错拍 — 详见 [satpu_cfg.md §6.2](satpu_cfg.md#62-ram_ro-读延迟已知-timing-gap)
+- 后续 APB 桥直接接 SAB 即可（roadmap 步 1 终态）
+
+**替代**：
+- 顶层保留 raw 端口 + 外部胶水做 APB 翻译 → 拒绝（每加一条 ISA 字段都要改 top 端口表 + 外部例化）
+- generator 加 `WO_PULSE` 类型 → 拒绝（仅本模块用一次，污染 generator 通用语义，顶层 2 行 FF 更直接）
+- uart `TX_DATA` 保留 `alen=1` 走前缀比较 → 拒绝（前缀 `sab_addr[3:1]` 会把 0x3 和 0x2 都命中，
+  与原"精确匹配"不等价）；改 yaml 用 `alen=0` 占单槽更干净
+
+详见 [satpu_cfg.md](satpu_cfg.md)。
+
+---
+
 ## D8 · controller 升级为指令级执行器；per-column deskew 上移；slot 概念取消（2026-06-26）
 
 **背景**：原 controller_ws 端口偏 session 粒度（`i_switch_weight / i_accum_slot / i_tile_num / i_start_addr`），
@@ -157,5 +257,4 @@ OS / IS 设计 doc 整体迁到 `doc/legacy/` 加 DEPRECATED banner。
 未来要落地的领域决策预留（写之前先有对应代码 / spec）：
 - ISA 编码冻结（步 2，见 [roadmap.md](roadmap.md)）
 - accumulator 增加 add（K 切段累加上层支持）
-- 量化 scale 定点化方案（per-tensor symmetric vs asymmetric）
 - DRAM / DMA / AXI 接入（步 3）

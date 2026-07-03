@@ -177,9 +177,10 @@ class ControllerWSRef:
         acc_wen_next   = [False] * self.AC
         acc_waddr_next = [0]     * self.AC
         acc_outen_next = [False] * self.AC
+        is_last_wtile = (self.wtile_idx == wtn - 1)
         acc_wen_next[0]   = wr_vld_scalar
         acc_waddr_next[0] = acc_addr_scalar
-        acc_outen_next[0] = wr_vld_scalar
+        acc_outen_next[0] = wr_vld_scalar and is_last_wtile
         for c in range(1, self.AC):
             acc_wen_next[c]   = self.acc_wen[c-1]
             acc_waddr_next[c] = self.acc_waddr[c-1]

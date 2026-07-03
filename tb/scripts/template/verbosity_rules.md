@@ -1,0 +1,4 @@
+- UVM_HIGH: component setup / configuration
+- UVM_MEDIUM: transaction-level events
+- UVM_LOW: process milestones (e.g. scoreboard match count, transaction count)
+- UVM_FULL / UVM_DEBUG: do not use by default

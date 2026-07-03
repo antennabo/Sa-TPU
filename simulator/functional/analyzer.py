@@ -1,9 +1,7 @@
 from abc import ABC, abstractmethod
-from compiler.frontend.ir import OpIR, MatMulIR, Conv2dIR, ElementwiseIR, ReductionOrder
+from compiler.frontend.ir import OpIR, MatMulIR, Conv2dIR
 from compiler.hw import HardwareConfig
-from .result import AnalysisResult, PerfResult, MemoryResult, NumericalResult
-from utils import quantize_weight, quantize_int8, np_linear, conv2d, np_relu, maxpool
-import numpy as np
+from .result import AnalysisResult, PerfResult, MemoryResult
 
 class Analyzer(ABC):
     name: str  # 子类定义，例如 "roofline" / "memory"
@@ -202,116 +200,6 @@ class MemoryAnalyzer(Analyzer):
         sram_bytes = hbm_bytes
         return MemoryResult(sram_bytes=sram_bytes, hbm_bytes=hbm_bytes, fits=sram_bytes <= hw.sram_bytes)
 
-
-class NumericalAnalyzer(Analyzer):
-    """数值精度分析器，支持单层（run）和全图（analyze_graph）两种模式"""
-    name = "numerical"
-
-    def analyze(self, op, _hw):
-        # 单层模式：要求 op.input_data 已填（用 fill_activations 预处理）
-        if not hasattr(op, "input_weight") or op.input_weight is None:
-            raise ValueError(f"{type(op).__name__} 缺少 input_weight")
-        if not hasattr(op, "input_data") or op.input_data is None:
-            raise ValueError(f"{type(op).__name__} 缺少 input_data，请先用 fill_activations 填充")
-        return self._analyze_single(op)
-
-    def _analyze_single(self, op) -> NumericalResult:
-        x = op.input_data.astype(np.float32)
-        W = op.input_weight.astype(np.float32)
-        b = op.bias.astype(np.float32) if op.bias is not None else 0
-        W_dq = quantize_weight(W, op.dtype)
-
-        if isinstance(op, MatMulIR):
-            out_fp32 = np_linear(x, W, b)
-            out_q    = np_linear(x, W_dq, b)
-        elif isinstance(op, Conv2dIR):
-            out_fp32 = conv2d(x, W, b)
-            out_q    = conv2d(x, W_dq, b)
-        else:
-            raise NotImplementedError(f"不支持 {type(op).__name__}")
-
-        error = np.abs(out_fp32 - out_q)
-        return NumericalResult(
-            max_error=float(error.max()),
-            mean_error=float(error.mean()),
-            reduction_order_used=op.reduction_order or ReductionOrder.SEQUENTIAL,
-            reference_order=ReductionOrder.SEQUENTIAL,
-            accum_overflow=False,
-            warnings=(),
-        )
-
-    def analyze_graph(self, irs, sample_input, exported) -> NumericalResult:
-        weights  = self._extract_weights(exported)
-        out_fp32 = self._forward(irs, sample_input, weights, quantize=False, debug=self.debug)
-        out_q    = self._forward(irs, sample_input, weights, quantize=True,  debug=self.debug)
-        print(f"=== NumericalAnalyzer result ===")
-        print(f"  fp32 output: {out_fp32}")
-        print(f"  int8 output: {out_q}")
-        error = np.abs(out_fp32 - out_q)
-        return NumericalResult(
-            max_error=float(error.max()),
-            mean_error=float(error.mean()),
-            reduction_order_used=ReductionOrder.SEQUENTIAL,
-            reference_order=ReductionOrder.SEQUENTIAL,
-            accum_overflow=False,
-            warnings=(),
-        )
-
-    @staticmethod
-    def _extract_weights(exported) -> list:
-        """按图顺序提取每个 Conv2d/Linear 的 (W, b)"""
-        param_map = {
-            spec.arg.name: spec.target
-            for spec in exported.graph_signature.input_specs
-            if spec.kind.name == "PARAMETER"
-        }
-        state_dict = exported.state_dict
-        weights = []
-        for node in exported.graph.nodes:
-            if node.op != "call_function":
-                continue
-            name = node.target.__name__ if hasattr(node.target, "__name__") else str(node.target)
-            if "conv2d" in name or "linear" in name:
-                W_node = node.args[1]
-                b_node = node.args[2] if len(node.args) > 2 else None
-                W = state_dict[param_map[W_node.target]].detach().numpy()
-                b = state_dict[param_map[b_node.target]].detach().numpy() if b_node else None
-                weights.append((W, b))
-        return weights
-
-    @staticmethod
-    def _forward(irs, sample_input, weights, quantize: bool, debug: bool = False):
-        x = sample_input.astype(np.float32)
-        wi = 0
-        for ir in irs:
-            if isinstance(ir, (Conv2dIR, MatMulIR)):
-                W, b = weights[wi]; wi += 1
-                b = b.astype(np.float32) if b is not None else 0
-                if quantize:
-                    # int8 x int8 → int32 accumulate, bias scaled to int32, dequantize out
-                    x_int8, _, scale_x = quantize_int8(x)
-                    W_int8, _, scale_w = quantize_int8(W.astype(np.float32))
-                    scale_b = scale_x * scale_w
-                    b_int32 = np.round(b / scale_b).astype(np.int32) if isinstance(b, np.ndarray) else 0
-                    x_int8 = x_int8.astype(np.int32)
-                    W_int8 = W_int8.astype(np.int32)
-                    if isinstance(ir, Conv2dIR):
-                        x = conv2d(x_int8, W_int8, b_int32).astype(np.float32) * scale_b
-                    else:
-                        x = np_linear(x_int8, W_int8, b_int32).astype(np.float32) * scale_b
-                    if debug:
-                        print(f"  [int8 {type(ir).__name__}] scale_x={scale_x:.4f} scale_w={scale_w:.4f} out={x.flatten()[:4]}")
-                else:
-                    x = conv2d(x, W.astype(np.float32), b) if isinstance(ir, Conv2dIR) else np_linear(x, W.astype(np.float32), b)
-                    if debug:
-                        print(f"  [fp32 {type(ir).__name__}] W={W.shape} x_out={x.flatten()[:4]}")
-            elif isinstance(ir, ElementwiseIR):
-                if ir.op == "relu":      x = np_relu(x)
-                elif ir.op == "maxpool": x = maxpool(x)
-                elif ir.op == "flatten": x = x.flatten()
-                if debug:
-                    print(f"  [fp32 {ir.op}] x_out shape={x.shape}")
-        return x
 
 class AnalysisPipeline:
     def __init__(self, analyzers: list[Analyzer]):

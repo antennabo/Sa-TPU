@@ -153,7 +153,7 @@ INT8 量化后的 **SimpleCNN / MNIST 推理**，达到 ≥ 98% test accuracy。
 | 主存 | 片外 DDR3，靠 DMA 拉取权重 | **纯片上 BRAM / URAM**（MVP） | 片上模型规模够用；DMA/DRAM 列为 Stretch |
 | Weight 加载粒度 | 一次性大批量 DMA | PIO 写口逐 tile | 无 DMA，配套 PIO |
 | 算子覆盖 | 含 normalize / pool 专用单元 | 不实现，详见 §4 | 教学规模 + 软件可替代 |
-| Scale 处理 | 硬件 requant 单元 | 浮点 scale → 定点化方案在 [isa.txt](isa.txt) §4 评估中 | 实现细节尚在收敛 |
+| Scale 处理 | 硬件 requant 单元 | M0/shift 定点化 + half-up 舍入 (见 [decisions.md](decisions.md) D10) | 软件 golden 契约已定, RTL 待实施 |
 | 量化方案 | per-channel 支持 | 仅 **per-tensor symmetric** | 简化通路 |
 
 ---

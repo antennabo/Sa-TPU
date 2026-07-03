@@ -77,6 +77,27 @@ def maxpool(x, kernel=2):
 import dataclasses
 from compiler.frontend.ir import Conv2dIR, MatMulIR, ElementwiseIR
 
+def extract_weights(exported) -> list:
+    """按图顺序从 torch.export 的 ExportedProgram 提取每个 Conv2d/Linear 的 (W, b)。"""
+    param_map = {
+        spec.arg.name: spec.target
+        for spec in exported.graph_signature.input_specs
+        if spec.kind.name == "PARAMETER"
+    }
+    state_dict = exported.state_dict
+    weights = []
+    for node in exported.graph.nodes:
+        if node.op != "call_function":
+            continue
+        name = node.target.__name__ if hasattr(node.target, "__name__") else str(node.target)
+        if "conv2d" in name or "linear" in name:
+            W_node = node.args[1]
+            b_node = node.args[2] if len(node.args) > 2 else None
+            W = state_dict[param_map[W_node.target]].detach().numpy()
+            b = state_dict[param_map[b_node.target]].detach().numpy() if b_node else None
+            weights.append((W, b))
+    return weights
+
 def fill_activations(irs: list, x) -> list:
     """逐层传播激活，填入每个计算层的 input_data"""
     result = []

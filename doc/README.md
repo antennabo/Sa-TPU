@@ -11,6 +11,7 @@ SimpleCNN / MNIST INT8 推理（详见 [scope.md](scope.md)）。
 | 第一次接触本项目 | [architecture.md](architecture.md) — 系统总览 + 模块图 + 维度约定 |
 | 想看 WS 数据流细节 | [systolic_array.md](systolic_array.md) — sa + pe + 权重双缓冲 |
 | 想看控制器 / FSM / 接口 | [controller_ws.md](controller_ws.md) — 6 态 FSM + 三道控制波 |
+| 想看顶层 SAB 寄存器接口 | [satpu_cfg.md](satpu_cfg.md) — 控制/数据全收 cfg 单总线（spec 草案）|
 | 想知道"为什么是当前方案" | [decisions.md](decisions.md) — 设计决策日志 |
 | 想知道"下一步做什么" | [roadmap.md](roadmap.md) — RV core + TPU 联动路线 |
 | 找指令集草案 | [isa.txt](isa.txt) — ISA v0 草案（待冻结）|

@@ -61,7 +61,10 @@ V*.mk
 # ============================================================
 **/simv
 **/simv.daidir/
+**/simv.vdb/
+**/sim_result/
 **/csrc/
+**/vc_hdrs.h
 **/ucli.key
 **/verdiLog/
 **/novas.conf

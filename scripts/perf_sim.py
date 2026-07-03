@@ -1,9 +1,9 @@
 import numpy as np
 from compiler.hw import HardwareConfig
 from compiler.frontend.ir import Conv2dIR, MatMulIR, ElementwiseIR
-from simulator.functional.analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, NumericalAnalyzer, AnalysisPipeline
+from simulator.functional.analyzer import RooflinePerfAnalyzer, MemoryAnalyzer, AnalysisPipeline
 from simulator.cycle.cycle_analyzer import CycleAccurateAnalyzer
-from utils import quantize_weight, conv2d, np_linear, np_relu, maxpool, im2col
+from utils import quantize_weight, conv2d, np_linear, np_relu, maxpool, im2col, extract_weights
 
 
 class Simulator:
@@ -12,7 +12,6 @@ class Simulator:
         self.x_np      = x_np
         self.hw        = hw
         self.static    = AnalysisPipeline([RooflinePerfAnalyzer(), MemoryAnalyzer()])
-        self.numerical = NumericalAnalyzer()
         self.cycle     = CycleAccurateAnalyzer()
 
     def run_static(self) -> dict:
@@ -20,13 +19,8 @@ class Simulator:
         self.print_static(results)
         return results
 
-    def run_numerical(self, exported):
-        result = self.numerical.analyze_graph(self.irs, self.x_np, exported)
-        self.print_numerical(result)
-        return result
-
     def run_cycle(self, exported):
-        weights = NumericalAnalyzer._extract_weights(exported)
+        weights = extract_weights(exported)
         x = self.x_np.astype(np.float32)
         wi = 0
         for op in self.irs:
@@ -60,11 +54,6 @@ class Simulator:
                     print(f"  {key} | {name}: {result}")
             else:
                 print(f"  {key}: {r}")
-
-    def print_numerical(self, result):
-        print("\n=== 数值分析 ===")
-        print(f"  max_error:  {result.max_error:.6f}")
-        print(f"  mean_error: {result.mean_error:.6f}")
 
     def print_cycle(self):
         print("\n=== Cycle 仿真结果 ===")

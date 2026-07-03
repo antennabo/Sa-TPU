@@ -1,0 +1,109 @@
+module: satpu_cfg
+addr_w: 16
+data_w: 32
+
+registers:
+  # ── 控制区 0x0000–0x000F ──────────────────────────────────────────
+  # START — 电平 RW, 顶层胶水做上升沿检测得 1 拍 i_start (doc §5.5)
+  - name: START
+    addr: 0x0
+    type: RW
+    fields:
+      - name: start
+        bits: "0"
+        reset: 0
+
+  # ACTIV_AVAIL — abuf 灌完后置 1, 电平直送 controller i_activ_available
+  - name: ACTIV_AVAIL
+    addr: 0x1
+    type: RW
+    fields:
+      - name: activ_avail
+        bits: "0"
+        reset: 0
+
+  # WTILE_NUM — 单指令跑几个 weight tile (≥1, ≤WTILE_NUM_MAX=128)
+  - name: WTILE_NUM
+    addr: 0x2
+    type: RW
+    fields:
+      - name: wtile_num
+        bits: "7:0"
+        reset: 0
+
+  # ACT_STADDR — abuf 读起点 (所有 wtile 共用, ACT_ADDR_W=11)
+  - name: ACT_STADDR
+    addr: 0x3
+    type: RW
+    fields:
+      - name: act_staddr
+        bits: "10:0"
+        reset: 0
+
+  # ACC_STADDR — accumulator 写起点 (ACC_ADDR_W=10)
+  - name: ACC_STADDR
+    addr: 0x4
+    type: RW
+    fields:
+      - name: acc_staddr
+        bits: "9:0"
+        reset: 0
+
+  # FEED_NUM — 每 wtile feed 行数 (≥W=AR+LATENCY, FEED_NUM_W=ACT_ADDR_W+1=12)
+  - name: FEED_NUM
+    addr: 0x5
+    type: RW
+    fields:
+      - name: feed_num
+        bits: "11:0"
+        reset: 0
+
+  # STATUS — 状态轮询
+  #   [2:0] = ws_state (controller o_ws_state)
+  #   [3]   = wfifo_full (|wfifo_full_per_col)
+  - name: STATUS
+    addr: 0x6
+    type: RO
+    src: tpu_status
+    fields:
+      - name: ws_state
+        bits: "2:0"
+      - name: wfifo_full
+        bits: "3"
+
+  # ── WFIFO 段 0x0010–0x0017 (alen=3 = 列 idx) ─────────────────────
+  # 写一字节进对应列的 wfifo (顶层胶水按 addr[2:0] demux wr_en)
+  - name: WFIFO
+    addr: 0x10
+    type: RAM_WO
+    alen: 3
+    dlen: 8
+    fields:
+      - name: wfifo
+        bits: "7:0"
+        reset: 0
+
+  # ── ACCUM 段 0x2000–0x3FFF (alen=13, 8 列 × 1024 行 = 8K word) ───
+  # addr[12:10] = 列 idx, addr[9:0] = accumulator 行地址
+  # 注意: accumulator REG_OUT 必须为 0 (组合读) 才能跟 cfg 读时序对齐 (doc §6.2)
+  - name: ACCUM
+    addr: 0x2000
+    type: RAM_RO
+    alen: 13
+    dlen: 32
+    src: accum_rdata
+    fields:
+      - name: accum
+        bits: "31:0"
+
+  # ── ABUF 段 0x4000–0x7FFF (alen=14, 8 lane × 2048 byte = 16K byte) ──
+  # addr[13:11] = lane idx (0..7), addr[10:0] = lane 内字节地址
+  - name: ABUF
+    addr: 0x4000
+    type: RAM_WO
+    alen: 14
+    dlen: 8
+    fields:
+      - name: abuf
+        bits: "7:0"
+        reset: 0

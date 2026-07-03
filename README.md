@@ -32,7 +32,9 @@ Sa-TPU/
 │   ├── data.py       后端数据结构
 │   └── backend.py    IR → 量化 → 分块 → 映射 → 编译
 ├── simulator/      阶段3：Python 仿真模型
-│   ├── functional/ 功能级（非周期）：数值正确性分析
+│   ├── functional/ 功能级（非周期）：静态分析（analyzer）+ 数值参考模型
+│   │                （numerical_model：MAC/requant/pool）+ tb golden 生成
+│   │                （tb_stimulus.dump_{linear,conv}_layer）
 │   └── cycle/      周期精确：cycle_analyzer + sim_model/（pe / controller /
 │                   spatial_array / accumulator / commonbuf / commonfifo ...）
 │                   tests/  本层全部单元/e2e 测试
@@ -81,6 +83,52 @@ python scripts/run.py
 
 需要 `model/simple_cnn.pth` 与 `build/data/`（MNIST）就位。模型可用 `python model/train.py`
 （在 `model/` 目录下运行）重新训练得到。
+
+### satpu_top 逐层 golden（per-tensor symmetric qint8，契约见 [D10](doc/decisions.md)）
+
+给 `satpu_top_tb` 生成每一层的对拍向量。从 `SimpleCNN` fp32 权重出发，走 fp32 forward +
+自建对称量化（`scale = max_abs / 127`，`zp = 0`），产出 `A / B / bias / Y_int32 / Y_int8 / params`
+供 tb 逐层比对。
+
+**不走** `torch.ao.quantization`：其 quantized Linear 只支持 quint8 activation，无法给出
+zp = 0 的 signed int8，与 SaTPU 契约冲突。整套流程走 numpy 自己做量化 + 两级 int32 累加
+（SA 内 psum 沿 K 流 + accumulator 跨 WTILE 累加，每处独立饱和）。
+
+```bash
+python -m scripts.gen_linear_golden               # 默认 chained（端到端串联），batch=1
+python -m scripts.gen_linear_golden --batch 8     # 8 张 MNIST 图，一起校验 argmax + accuracy
+python -m scripts.gen_linear_golden --isolated    # 每层从 fp32 独立采样，不用上一层 int8 输出
+```
+
+**产物**：`build/satpu_top_cosim/{conv0, fc1, fc3}/`
+
+| 文件 | 内容 |
+|---|---|
+| `A.txt` | `(M_pad, K_pad)` int8，本层输入激活 |
+| `B.txt` | `(K_pad, N_pad)` int8，权重（已按 SA 面朝向转置） |
+| `bias.txt` | `(N_pad,)` int32，`round(bias_fp32 / (scale_x·scale_w))` 折算后 |
+| `Y_int32.txt` | `(M_pad, N_pad)` int32，MAC + bias 之后、requant 之前 |
+| `Y_int8.txt` | `(M_pad, N_pad)` int8，requant + 可选 ReLU 融合之后 |
+| `Y_int8_pool.txt` | 仅 conv0：post-MaxPool 的 int8（下一层 A 的来源，chained 模式用） |
+| `params.txt` | `scale_x/w/y`、`M0`、`shift`、`relu` 位、`a_max/y_max`、conv 层元信息 |
+
+**Chained vs Isolated**：
+- Chained（默认）：conv0 的 `Y_int8_pool` 直接喂进 fc.1 作 A，fc.1 的 `scale_x = conv0.scale_y`
+  （硬件真实数据流）
+- Isolated：每层的 A 都从 fp32 网络重新抓 activation 再量化（每层独立测试用）
+
+**末尾自动跑 argmax 对拍**：
+```
+[verify] fp32 ↔ golden agree: 507/512  (99.02%)
+[verify] fp32   accuracy:             87.70%
+[verify] golden accuracy:             87.89%
+[verify] quantization loss (Δacc):    -0.20 pp
+```
+
+- **agree ≥ 99%**：pipeline 数值语义健康（fp32 与 golden argmax 一致）
+- **Δacc 在 ±0.5 pp 内**：量化损失在业界"接近无损"区间（MNIST 尺度）
+- 若绝对 accuracy 低于预期，先怀疑 `simple_cnn.pth` 训练不充分（跑 `model/train.py` 补训），
+  跟量化 pipeline 无关
 
 ### RTL 仿真与逐拍对拍（cosim）
 

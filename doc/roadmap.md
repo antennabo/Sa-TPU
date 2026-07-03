@@ -76,12 +76,12 @@ RTOS 运行成功、DSP 乘法器（1 拍延迟）。
 ## 4. 全程风险 + 待确认 ⚠️
 
 **风险**（从步 1 起盯）：
-1. **量化数值对齐** — 浮点 scale 定点化的舍入 + requant 舍入/边界。软件 golden 阶段定死规则，RTL 严格照搬。
+1. **量化数值对齐** — 浮点 scale 定点化的舍入 + requant 舍入/边界。软件 golden 契约已定 ([decisions.md](decisions.md) D10)，RTL 严格照搬。
 2. **AHB/AXI 握手时序** — 集成阶段主要坑，ILA 早介入。
 
-**待确认**：
-- zero-point 是否为 0（对称量化可简化 requant）— 翻量化参数即知。
-- 激活饱和边界：有符号 [-128,127] vs 无符号 [0,255]。
+**待确认**（原有条目已由 D10 消化）：
+- ~~zero-point 是否为 0~~ ✅ 契约定为 0（per-tensor symmetric qint8，[decisions.md](decisions.md) D10）
+- ~~激活饱和边界：有符号 [-128,127] vs 无符号 [0,255]~~ ✅ signed `[-128,127]`；ReLU 融进 requant 时 clip_min 收到 0 → `[0, 127]`（D10）
 
 ---
 ---
@@ -104,14 +104,15 @@ RTOS 运行成功、DSP 乘法器（1 拍延迟）。
 
 ### 步 1b · 编译器
 **任务**
-- A1 定点化单层 → A2 requant 约定 → A3 conv(im2col) → A4 ReLU+bias
+- A1 定点化单层 ✅ → A2 requant 约定 ✅ ([decisions.md](decisions.md) D10) → A3 conv(im2col) ✅ → A4 ReLU+bias ✅
+  （四项由 `simulator/functional/{numerical_model,tb_stimulus}.py` 完成软件 golden，见 `scripts/gen_linear_golden.py`）
 - **编译器**：权重打包、tile 调度/地址生成（`emit_matmul_program` 已起步）。
 
 ### 步 1c · rtl
 **任务**
 - 按照 Python 模型完成 RTL ✅（[architecture.md](architecture.md) §3 五模块已落地、tinytpu_top 整合完成）
 - 通过 raw 写口（abuf/wfifo）+ controller_ws 上层握手，一步一步算一层
-- **RTL**：PE 微架构 ✅ → 8×8 阵列 ✅ → APB 寄存器/状态机 ⏳ → requant 通路 ⏳
+- **RTL**：PE 微架构 ✅ → 8×8 阵列 ✅ → APB 寄存器/状态机 ⏳ → requant 通路 ⏳（契约 D10，待实施）
 
 **验收条件**
 - 单层 GEMM（单 tile）：RTL 波形**逐拍 + 逐值**对齐 Python golden（WS）✅（tpu_top_tb 已通过）

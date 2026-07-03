@@ -27,7 +27,7 @@ model = SimpleCNN().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss()
 
-for epoch in range(100):
+for epoch in range(10):
     model.train()
     loop = tqdm(train_loader, desc=f"Epoch {epoch+1}")
     for x, y in loop:
@@ -48,8 +48,9 @@ for epoch in range(100):
             pred = model(x).argmax(1)
             correct += pred.eq(y).sum().item()
             total += y.size(0)
+    acc = correct / total * 100
+    print(f"Accuracy: {acc:.2f}%")
 
-    print(f"Accuracy: {correct / total * 100:.2f}%")
-
-
-torch.save(model.state_dict(), "simple_cnn.pth")
+    if acc > best_acc:
+        best_acc = acc
+        torch.save(model.state_dict(), "simple_cnn_best.pth")
