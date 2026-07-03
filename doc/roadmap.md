@@ -53,25 +53,24 @@ RTOS 运行成功、DSP 乘法器（1 拍延迟）。
 
 1. **layout 规范**：权重/激活在 BRAM/DRAM 怎么摆，阵列灌权重顺序。
    （现状散在 `compiler/` tiling + [systolic_array.md](systolic_array.md) §5；待整合到 ISA 落定时一并冻结）
-2. **ISA 规范**：指令编码 + 语义。**地址字段预留 DRAM 宽度（32 位）**，步 3 加 DRAM 不用改 ISA。
-   （现状 [isa.txt](isa.txt) 草案 + `compiler/instr.py`，待定稿冻结）
+2. **ISA 规范**：指令编码 + 语义。**地址字段预留 DRAM 宽度（32 位）**，步 2 加 DRAM 不用改 ISA。
+   （现状 [isa.txt](isa.txt) 草案 + `compiler/instr.py`，待步 3 定稿冻结）
 3. **时序约定规范**：握手拍数语义（start/done 在第几拍）、各模块固定延迟、流水级数。
    Python 和 RTL 都照这份，否则会 debug 大量"其实只是约定不同"的假 bug。
    （现状 [controller_ws.md](controller_ws.md) §7 + [architecture.md](architecture.md) §5，待持续维护）
 
-## 3. 五步演进（每步一个明确瓶颈，不提前）
+## 3. 四步演进（每步一个明确瓶颈，不提前）
 
 | 步 | 存储 | 总线/搬运 | 控制方式 | 解决的瓶颈 |
 |---|---|---|---|---|
-| 1 | BRAM | APB | CPU 逐寄存器直驱 | 基线，阵列复用 |
-| 2 | BRAM | APB | 指令流，硬件解析 | 控制下放硬件 |
-| 3 | +DRAM | +DMA+AXI | 指令 | 容量 + 搬运带宽 |
-| 4 | DRAM | DMA | 指令 | double buffer 隐藏访存 |
-| 5 | DRAM | DMA | 指令并行 | 计算流水 |
+| 1 | BRAM | APB | CPU 逐寄存器直驱 | 功能正确，阵列复用 |
+| 2 | +DRAM | +DMA+AXI | CPU 逐寄存器直驱 | 接口标准化 + 高速化（容量 + 搬运带宽）|
+| 3 | DRAM | DMA+AXI | 指令流，硬件解析 | 指令化（控制下放硬件）|
+| 4 | DRAM | DMA+AXI | 指令流 | 计算流水（指令并行）|
 
 - 贯穿：第 1 步结果做黄金参考，每步上板逐层对拍。
-- ISA 在第 2 步定稿并冻结，第 3 步起不再改。
-- 总线背景：RISC-V 当前只有 AHB/APB（AHB 暂不支持 burst）。第 1 步统一用 APB。
+- ISA 在第 3 步定稿并冻结，第 4 步起不再改。
+- 总线背景：RISC-V 当前只有 AHB/APB（AHB 暂不支持 burst）。第 1 步统一用 APB，第 2 步引入 AXI。
 
 ## 4. 全程风险 + 待确认 ⚠️
 
@@ -118,31 +117,23 @@ RTOS 运行成功、DSP 乘法器（1 拍延迟）。
 - 单层 GEMM（单 tile）：RTL 波形**逐拍 + 逐值**对齐 Python golden（WS）✅（tpu_top_tb 已通过）
 - 上板测试能正确计算单层网络 ⏳
 
-## 步 2 · 指令流，硬件解析（控制下放硬件）
+## 步 2 · 接口标准化 + 高速化（+DRAM + DMA + AXI）
+
+**目标**：片上放不下时上 DRAM，引入 DMA 主口 + AXI 解决容量与搬运带宽；总线标准化。
+
+**任务**：DMA 主口 + AXI · DRAM 控制 · layout 扩到 DRAM（地址字段预留 32 位 DRAM 宽度）· AHB 仲裁。控制方式仍是 CPU 逐寄存器直驱。
+
+**验收**：大于片上容量的层在 DRAM 上跑通，搬运带宽达标，结果对齐步 1 golden。
+
+## 步 3 · 指令化（控制下放硬件）
 
 **目标**：控制逻辑从 CPU 逐寄存器直驱，下放成"CPU 发指令流、硬件解析执行"。**ISA 在此定稿并冻结。**
 
 **任务**：RTL 指令解析器（取指→译码→驱动状态机）· 固件改成下发指令流 · 编译器线产出指令流（已有 `emit_matmul_program`）。
 
-**验收**：CPU 发一段指令流跑完单层 GEMM，结果对齐步 1 golden；ISA 冻结文档。
+**验收**：CPU 发一段指令流跑完单层 GEMM，结果对齐前序 golden；ISA 冻结文档。
 
-## 步 3 · +DRAM + DMA + AXI（容量 + 搬运带宽）
-
-**目标**：片上放不下时上 DRAM，引入 DMA 主口 + AXI 解决容量与搬运带宽。
-
-**任务**：DMA 主口 + AXI · DRAM 控制 · layout 扩到 DRAM（ISA 地址字段已预留 32 位，不改 ISA）· AHB 仲裁。
-
-**验收**：大于片上容量的层在 DRAM 上跑通，搬运带宽达标，结果对齐 golden。
-
-## 步 4 · double buffer（隐藏访存）
-
-**目标**：计算与搬运重叠，用双缓冲隐藏访存延迟。
-
-**任务**：权重/激活 ping-pong 双缓冲（Python 线先测加速比再写 RTL）。
-
-**验收**：访存被计算隐藏，PE 利用率较步 3 提升（Python 模型预测值 vs 上板实测对齐）。
-
-## 步 5 · 指令并行（计算流水）
+## 步 4 · 计算流水（指令并行）
 
 **目标**：指令级并行，拉满计算流水。
 
